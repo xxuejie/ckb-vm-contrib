@@ -182,6 +182,11 @@ fn parse_utype(
     opcode: InstructionOpcode,
     stream: &mut InstrStream,
 ) -> Result<TaggedInstruction, Error> {
+    // https://github.com/riscv-non-isa/riscv-asm-manual/blob/a9945e1db585abaed594d55ff84e87dd93e21723/riscv-asm.md#-a-listing-of-standard-risc-v-pseudoinstructions
+    if opcode == opcodes::OP_JAL && stream.remaining() == 1 {
+        let immediate = stream.next_number()?;
+        return Ok(Utype::new(opcode, 1, immediate as u32).into());
+    }
     let rd = stream.next_register()?;
     let immediate = stream.next_number()?;
     Ok(Utype::new(opcode, rd, immediate as u32).into())
