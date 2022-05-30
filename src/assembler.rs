@@ -22,17 +22,19 @@ pub fn parse(input: &str) -> Result<Vec<TaggedInstruction>, Error> {
         let opcode_name = stream.next_token()?;
         if let Some((opcode, f)) = PARSER_FUNCS.get(opcode_name) {
             let inst = f(*opcode, &mut stream)?;
-            if stream.has_token() {
-                return Err(Error::External(format!(
-                    "Trailing token exists for \"{}\"",
-                    line
-                )));
-            }
             insts.push(inst);
+        } else if let Some(parsed_insts) = parse_pseudoinstructions(opcode_name, &mut stream)? {
+            insts.extend(parsed_insts);
         } else {
             return Err(Error::External(format!(
                 "Invalid instruction {}!",
                 opcode_name
+            )));
+        }
+        if stream.has_token() {
+            return Err(Error::External(format!(
+                "Trailing token exists for \"{}\"",
+                line
             )));
         }
     }
@@ -197,6 +199,22 @@ fn parse_noarg_rtype(
     _stream: &mut InstrStream,
 ) -> Result<TaggedInstruction, Error> {
     Ok(Rtype::new(opcode, 0, 0, 0).into())
+}
+
+fn parse_pseudoinstructions(
+    opcode_name: &str,
+    stream: &mut InstrStream,
+) -> Result<Option<Vec<TaggedInstruction>>, Error> {
+    match opcode_name {
+        "jr" => Ok(Some(vec![Itype::new_u(
+            opcodes::OP_JALR,
+            0,
+            stream.next_register()?,
+            0,
+        )
+        .into()])),
+        _ => Ok(None),
+    }
 }
 
 struct InstrStream<'a> {
