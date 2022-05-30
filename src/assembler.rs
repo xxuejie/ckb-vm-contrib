@@ -13,13 +13,22 @@ use std::str::FromStr;
 
 /// Parse RISC-V instructions in text format into ckb-vm instruction formats
 pub fn parse(input: &str) -> Result<Vec<TaggedInstruction>, Error> {
-    let mut stream = InstrStream::create(input);
     let mut insts = Vec::new();
 
-    while stream.has_token() {
+    // First, ensure multiple lines are processed correctly
+    let lines = input.trim().split('\n');
+    for line in lines {
+        let mut stream = InstrStream::create(line);
         let opcode_name = stream.next_token()?;
         if let Some((opcode, f)) = PARSER_FUNCS.get(opcode_name) {
-            insts.push(f(*opcode, &mut stream)?);
+            let inst = f(*opcode, &mut stream)?;
+            if stream.has_token() {
+                return Err(Error::External(format!(
+                    "Trailing token exists for \"{}\"",
+                    line
+                )));
+            }
+            insts.push(inst);
         } else {
             return Err(Error::External(format!(
                 "Invalid instruction {}!",
@@ -64,6 +73,7 @@ lazy_static! {
         m.insert("slliw", (opcodes::OP_SLLIW, parse_itype as ParserFunc));
         m.insert("srliw", (opcodes::OP_SRLIW, parse_itype as ParserFunc));
         m.insert("sraiw", (opcodes::OP_SRAIW, parse_itype as ParserFunc));
+        m.insert("jalr", (opcodes::OP_JALR, parse_itype as ParserFunc));
         // R type
         m.insert("add", (opcodes::OP_ADD, parse_rtype as ParserFunc));
         m.insert("sub", (opcodes::OP_SUB, parse_rtype as ParserFunc));
@@ -123,6 +133,11 @@ fn parse_itype(
     opcode: InstructionOpcode,
     stream: &mut InstrStream,
 ) -> Result<TaggedInstruction, Error> {
+    // https://github.com/riscv-non-isa/riscv-asm-manual/blob/a9945e1db585abaed594d55ff84e87dd93e21723/riscv-asm.md#-a-listing-of-standard-risc-v-pseudoinstructions
+    if opcode == opcodes::OP_JALR && stream.remaining() == 1 {
+        let rs1 = stream.next_register()?;
+        return Ok(Itype::new_u(opcode, 1, rs1, 0).into());
+    }
     let rd = stream.next_register()?;
     let rs1 = stream.next_register()?;
     let immediate = stream.next_number()?;
@@ -187,7 +202,6 @@ struct InstrStream<'a> {
 impl<'a> InstrStream<'a> {
     fn create(input: &'a str) -> Self {
         let tokens = input
-            // First, ensure multiple lines are processed correctly
             .trim()
             .split('\n')
             // For each line, # starts a comment till the end of line
@@ -212,8 +226,12 @@ impl<'a> InstrStream<'a> {
         Self { tokens, current: 0 }
     }
 
+    fn remaining(&self) -> usize {
+        self.tokens.len() - self.current
+    }
+
     fn has_token(&self) -> bool {
-        self.current < self.tokens.len()
+        self.remaining() > 0
     }
 
     fn peek_token(&self) -> Result<&'a str, Error> {
