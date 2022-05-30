@@ -206,6 +206,12 @@ fn parse_pseudoinstructions(
     stream: &mut InstrStream,
 ) -> Result<Option<Vec<TaggedInstruction>>, Error> {
     match opcode_name {
+        "j" => Ok(Some(vec![Utype::new(
+            opcodes::OP_JAL,
+            0,
+            stream.next_number()? as u32,
+        )
+        .into()])),
         "jr" => Ok(Some(vec![Itype::new_u(
             opcodes::OP_JALR,
             0,
@@ -213,6 +219,21 @@ fn parse_pseudoinstructions(
             0,
         )
         .into()])),
+        "ret" => Ok(Some(vec![Itype::new_u(opcodes::OP_JALR, 0, 1, 0).into()])),
+        "call" => {
+            let offset = stream.next_number()? as u32;
+            Ok(Some(vec![
+                Utype::new(opcodes::OP_AUIPC, 6, offset >> 12).into(),
+                Itype::new_u(opcodes::OP_JALR, 1, 6, offset & 0xFFF).into(),
+            ]))
+        }
+        "tail" => {
+            let offset = stream.next_number()? as u32;
+            Ok(Some(vec![
+                Utype::new(opcodes::OP_AUIPC, 6, offset >> 12).into(),
+                Itype::new_u(opcodes::OP_JALR, 0, 6, offset & 0xFFF).into(),
+            ]))
+        }
         _ => Ok(None),
     }
 }
