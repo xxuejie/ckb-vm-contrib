@@ -1,0 +1,15 @@
+[package]
+name = "ckb-vm-contrib"
+description = "Collection of decoupled code for ckb-vm"
+version = "0.1.0"
+license = "MIT"
+authors = ["Xuejie Xiao <xxuejie@gmail.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ckb-vm = { git = "https://github.com/xxuejie/ckb-vm", rev = "55dff01" }
+ckb-vm-definitions = { git = "https://github.com/xxuejie/ckb-vm", rev = "55dff01" }
+lazy_static = "1.4.0"
+regex = "1.5.4"
