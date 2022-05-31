@@ -1,6 +1,9 @@
+pub mod i;
+mod utils;
+
 use ckb_vm::{
     instructions::{tagged::TaggedInstruction, Itype, RegisterIndex, Rtype, Stype, Utype},
-    Error,
+    Error, Register,
 };
 use ckb_vm_definitions::{
     instructions::{self as opcodes, InstructionOpcode},
@@ -42,10 +45,45 @@ pub fn parse(input: &str) -> Result<Vec<TaggedInstruction>, Error> {
     Ok(insts)
 }
 
+pub type InstructionAssembler = fn(inst: &TaggedInstruction) -> Option<Vec<u8>>;
+
+#[derive(Default)]
+pub struct Assembler {
+    factories: Vec<InstructionAssembler>,
+}
+
+impl Assembler {
+    pub fn new() -> Assembler {
+        Assembler {
+            factories: Vec::new(),
+        }
+    }
+
+    pub fn add_assembler_factory(&mut self, factory: InstructionAssembler) {
+        self.factories.push(factory);
+    }
+
+    pub fn assemble(&self, inst: &TaggedInstruction) -> Result<Vec<u8>, Error> {
+        for factory in &self.factories {
+            if let Some(binary) = factory(inst) {
+                return Ok(binary);
+            }
+        }
+        Err(Error::External(format!("Invalid instruction {}", inst)))
+    }
+}
+
 /// Assemble ckb-vm instructions into binary bytes
-pub fn assemble(_insts: &[TaggedInstruction]) -> Result<Vec<u8>, Error> {
-    // Note: like decoders, RISC-V extension separation will be introduced here.
-    unimplemented!()
+pub fn assemble<R: Register>(insts: &[TaggedInstruction]) -> Result<Vec<u8>, Error> {
+    let mut assembler = Assembler::new();
+    assembler.add_assembler_factory(i::assembler::<R>);
+
+    let mut content = Vec::new();
+    for inst in insts {
+        content.extend(assembler.assemble(inst)?);
+    }
+
+    Ok(content)
 }
 
 lazy_static! {
