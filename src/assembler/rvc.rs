@@ -500,7 +500,7 @@ fn full_register(reg: usize, shift: usize) -> u16 {
 
 #[inline(always)]
 fn is_compact_register(reg: usize) -> bool {
-    reg >= 8 && reg <= 15
+    (8..=15).contains(&reg)
 }
 
 #[inline(always)]
