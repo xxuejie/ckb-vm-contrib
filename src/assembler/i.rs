@@ -67,6 +67,8 @@ fn assemble_rtype<R: Register>(i: &Rtype) -> Option<u32> {
         opcodes::OP_SLLW => Some(funct7(0b0000000) | funct3(0b001) | opcode(0b0111011)),
         opcodes::OP_SRLW => Some(funct7(0b0000000) | funct3(0b101) | opcode(0b0111011)),
         opcodes::OP_SRAW => Some(funct7(0b0100000) | funct3(0b101) | opcode(0b0111011)),
+        opcodes::OP_ECALL => return Some(0x73),
+        opcodes::OP_EBREAK => return Some(0x100073),
         _ => None,
     }
     .map(|packed| packed | rs2(i.rs2()) | rs1(i.rs1()) | rd(i.rd()))
