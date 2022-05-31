@@ -1,4 +1,5 @@
 pub mod i;
+pub mod m;
 mod utils;
 
 use ckb_vm::{
@@ -77,6 +78,7 @@ impl Assembler {
 pub fn assemble<R: Register>(insts: &[TaggedInstruction]) -> Result<Vec<u8>, Error> {
     let mut assembler = Assembler::new();
     assembler.add_assembler_factory(i::assembler::<R>);
+    assembler.add_assembler_factory(m::assembler::<R>);
 
     let mut content = Vec::new();
     for inst in insts {
