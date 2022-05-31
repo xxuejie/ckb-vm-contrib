@@ -1,5 +1,6 @@
 pub mod i;
 pub mod m;
+pub mod rvc;
 mod utils;
 
 use ckb_vm::{
@@ -77,6 +78,8 @@ impl Assembler {
 /// Assemble ckb-vm instructions into binary bytes
 pub fn assemble<R: Register>(insts: &[TaggedInstruction]) -> Result<Vec<u8>, Error> {
     let mut assembler = Assembler::new();
+    // Order here matters, rvc should be invoked first
+    assembler.add_assembler_factory(rvc::assembler::<R>);
     assembler.add_assembler_factory(i::assembler::<R>);
     assembler.add_assembler_factory(m::assembler::<R>);
 
