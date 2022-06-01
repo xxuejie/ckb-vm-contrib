@@ -58,7 +58,7 @@ pub fn utype_immediate(immediate: i32) -> u32 {
 #[inline(always)]
 pub fn stype_immediate(immediate: i32) -> u32 {
     let i = immediate as u32;
-    (((i >> 5) & 0b111_1111) << 25) | ((i & 0b1_1111) << 6)
+    (((i >> 5) & 0b111_1111) << 25) | ((i & 0b1_1111) << 7)
 }
 
 #[inline(always)]

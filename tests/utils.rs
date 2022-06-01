@@ -42,6 +42,26 @@ pub fn rtype_op() -> impl Strategy<Value = InstructionOpcode> {
     ])
 }
 
+pub fn stype_branch_op() -> impl Strategy<Value = InstructionOpcode> {
+    prop::sample::select(vec![
+        opcodes::OP_BEQ,
+        opcodes::OP_BNE,
+        opcodes::OP_BLT,
+        opcodes::OP_BGE,
+        opcodes::OP_BLTU,
+        opcodes::OP_BGEU,
+    ])
+}
+
+pub fn stype_store_op() -> impl Strategy<Value = InstructionOpcode> {
+    prop::sample::select(vec![
+        opcodes::OP_SB,
+        opcodes::OP_SH,
+        opcodes::OP_SW,
+        opcodes::OP_SD,
+    ])
+}
+
 pub fn assert_same_tagged(i: &TaggedInstruction, i2: &TaggedInstruction) {
     match (i, i2) {
         (TaggedInstruction::Rtype(i), TaggedInstruction::Rtype(i2)) => {
