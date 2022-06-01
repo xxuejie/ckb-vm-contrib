@@ -21,6 +21,11 @@ pub fn shamt<R: Register>(immediate: i32) -> u32 {
 }
 
 #[inline(always)]
+pub fn shamtw<R: Register>(immediate: i32) -> u32 {
+    ((immediate as u32) & 0b11_1111) << 20
+}
+
+#[inline(always)]
 pub fn rd(reg: usize) -> u32 {
     ((reg as u32) & 0b1_1111) << 7
 }

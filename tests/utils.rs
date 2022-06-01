@@ -62,6 +62,38 @@ pub fn stype_store_op() -> impl Strategy<Value = InstructionOpcode> {
     ])
 }
 
+pub fn itype_normal_op() -> impl Strategy<Value = InstructionOpcode> {
+    prop::sample::select(vec![
+        opcodes::OP_JALR,
+        opcodes::OP_LB,
+        opcodes::OP_LH,
+        opcodes::OP_LW,
+        opcodes::OP_LD,
+        opcodes::OP_LBU,
+        opcodes::OP_LHU,
+        opcodes::OP_LWU,
+        opcodes::OP_ADDI,
+        opcodes::OP_SLTI,
+        opcodes::OP_SLTIU,
+        opcodes::OP_XORI,
+        opcodes::OP_ORI,
+        opcodes::OP_ANDI,
+        opcodes::OP_ADDIW,
+    ])
+}
+
+pub fn itype_shift_op() -> impl Strategy<Value = InstructionOpcode> {
+    prop::sample::select(vec![opcodes::OP_SLLI, opcodes::OP_SRLI, opcodes::OP_SRAI])
+}
+
+pub fn itype_shiftw_op() -> impl Strategy<Value = InstructionOpcode> {
+    prop::sample::select(vec![
+        opcodes::OP_SLLIW,
+        opcodes::OP_SRLIW,
+        opcodes::OP_SRAIW,
+    ])
+}
+
 pub fn assert_same_tagged(i: &TaggedInstruction, i2: &TaggedInstruction) {
     match (i, i2) {
         (TaggedInstruction::Rtype(i), TaggedInstruction::Rtype(i2)) => {

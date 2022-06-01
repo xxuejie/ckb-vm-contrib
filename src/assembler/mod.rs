@@ -184,8 +184,22 @@ fn parse_itype(
         return Ok(Itype::new_u(opcode, 1, rs1, 0).into());
     }
     let rd = stream.next_register()?;
-    let rs1 = stream.next_register()?;
-    let immediate = stream.next_number()?;
+    let (rs1, immediate) = match (stream.peek_register(), stream.peek_number()) {
+        (Ok(rs1), _) => {
+            stream.next_token()?;
+            (rs1, stream.next_number()?)
+        }
+        (_, Ok(immediate)) => {
+            stream.next_token()?;
+            (stream.next_register()?, immediate)
+        }
+        _ => {
+            return Err(Error::External(format!(
+                "Invalid token: {}",
+                stream.peek_token()?
+            )))
+        }
+    };
     Ok(Itype::new_u(opcode, rd, rs1, immediate as u32).into())
 }
 

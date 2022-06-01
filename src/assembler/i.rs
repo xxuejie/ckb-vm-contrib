@@ -27,7 +27,7 @@ fn assemble_itype<R: Register>(i: &Itype) -> Option<u32> {
         opcodes::OP_LWU => Some(funct3(0b110) | opcode(0b0000011)),
         opcodes::OP_ADDI => Some(funct3(0b000) | opcode(0b0010011)),
         opcodes::OP_SLTI => Some(funct3(0b010) | opcode(0b0010011)),
-        opcodes::OP_SLTIU => Some(funct3(0b001) | opcode(0b0010011)),
+        opcodes::OP_SLTIU => Some(funct3(0b011) | opcode(0b0010011)),
         opcodes::OP_XORI => Some(funct3(0b100) | opcode(0b0010011)),
         opcodes::OP_ORI => Some(funct3(0b110) | opcode(0b0010011)),
         opcodes::OP_ANDI => Some(funct3(0b111) | opcode(0b0010011)),
@@ -41,12 +41,18 @@ fn assemble_itype<R: Register>(i: &Itype) -> Option<u32> {
             opcodes::OP_SLLI => Some(funct3(0b001) | opcode(0b0010011) | funct7(0b0000000)),
             opcodes::OP_SRLI => Some(funct3(0b101) | opcode(0b0010011) | funct7(0b0000000)),
             opcodes::OP_SRAI => Some(funct3(0b101) | opcode(0b0010011) | funct7(0b0100000)),
+            _ => None,
+        }
+        .map(|packed| packed | shamt::<R>(i.immediate_s()) | rs1(i.rs1()) | rd(i.rd()))
+    })
+    .or_else(|| {
+        match i.op() {
             opcodes::OP_SLLIW => Some(funct3(0b001) | opcode(0b0011011) | funct7(0b0000000)),
             opcodes::OP_SRLIW => Some(funct3(0b101) | opcode(0b0011011) | funct7(0b0000000)),
             opcodes::OP_SRAIW => Some(funct3(0b101) | opcode(0b0011011) | funct7(0b0100000)),
             _ => None,
         }
-        .map(|packed| packed | shamt::<R>(i.immediate_s()) | rs1(i.rs1()) | rd(i.rd()))
+        .map(|packed| packed | shamtw::<R>(i.immediate_s()) | rs1(i.rs1()) | rd(i.rd()))
     })
 }
 
