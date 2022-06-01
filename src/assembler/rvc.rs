@@ -505,7 +505,7 @@ fn is_compact_register(reg: usize) -> bool {
 
 #[inline(always)]
 pub fn funct4(funct: u16) -> u16 {
-    (funct & 0b111) << 12
+    (funct & 0b111) << 13
 }
 
 #[inline(always)]

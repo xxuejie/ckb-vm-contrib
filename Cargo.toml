@@ -13,3 +13,6 @@ ckb-vm = { git = "https://github.com/xxuejie/ckb-vm", rev = "55dff01" }
 ckb-vm-definitions = { git = "https://github.com/xxuejie/ckb-vm", rev = "55dff01" }
 lazy_static = "1.4.0"
 regex = "1.5.4"
+
+[dev-dependencies]
+proptest = "1.0.0"
