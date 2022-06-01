@@ -9,7 +9,37 @@ use proptest::prelude::*;
 use std::marker::PhantomData;
 
 pub fn rtype_op() -> impl Strategy<Value = InstructionOpcode> {
-    prop::sample::select(vec![opcodes::OP_ADD, opcodes::OP_AND])
+    // TODO: how can we derive this?
+    prop::sample::select(vec![
+        opcodes::OP_ADD,
+        opcodes::OP_SUB,
+        opcodes::OP_SLL,
+        opcodes::OP_SLT,
+        opcodes::OP_SLTU,
+        opcodes::OP_XOR,
+        opcodes::OP_SRL,
+        opcodes::OP_SRA,
+        opcodes::OP_OR,
+        opcodes::OP_AND,
+        opcodes::OP_ADDW,
+        opcodes::OP_SUBW,
+        opcodes::OP_SLLW,
+        opcodes::OP_SRLW,
+        opcodes::OP_SRAW,
+        opcodes::OP_MUL,
+        opcodes::OP_MULW,
+        opcodes::OP_MULH,
+        opcodes::OP_MULHSU,
+        opcodes::OP_MULHU,
+        opcodes::OP_DIV,
+        opcodes::OP_DIVW,
+        opcodes::OP_DIVU,
+        opcodes::OP_DIVUW,
+        opcodes::OP_REM,
+        opcodes::OP_REMW,
+        opcodes::OP_REMU,
+        opcodes::OP_REMUW,
+    ])
 }
 
 pub fn assert_same_tagged(i: &TaggedInstruction, i2: &TaggedInstruction) {

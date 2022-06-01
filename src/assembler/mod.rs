@@ -131,7 +131,7 @@ lazy_static! {
         m.insert("or", (opcodes::OP_OR, parse_rtype as ParserFunc));
         m.insert("and", (opcodes::OP_AND, parse_rtype as ParserFunc));
         m.insert("addw", (opcodes::OP_ADDW, parse_rtype as ParserFunc));
-        m.insert("subw", (opcodes::OP_ADDW, parse_rtype as ParserFunc));
+        m.insert("subw", (opcodes::OP_SUBW, parse_rtype as ParserFunc));
         m.insert("sllw", (opcodes::OP_SLLW, parse_rtype as ParserFunc));
         m.insert("srlw", (opcodes::OP_SRLW, parse_rtype as ParserFunc));
         m.insert("sraw", (opcodes::OP_SRAW, parse_rtype as ParserFunc));
