@@ -389,12 +389,11 @@ fn in_range(value: i32, lower: usize, higher: usize, signed: bool, can_be_zero: 
     }
     if signed {
         let left_minus_mask = !((1 << higher) - 1);
-        if value & left_minus_mask == left_minus_mask {
-            return true;
-        }
+        value & left_minus_mask == left_minus_mask || value & left_minus_mask == 0
+    } else {
+        let left_mask = !((1 << (higher + 1)) - 1);
+        value & left_mask == 0 
     }
-    let left_mask = !((1 << (higher + 1)) - 1);
-    value & left_mask == 0
 }
 
 #[inline(always)]
