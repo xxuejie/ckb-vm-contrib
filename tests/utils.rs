@@ -1,10 +1,16 @@
 #![allow(dead_code)]
 
 use ckb_vm::{
-    instructions::{tagged::TaggedInstruction, Instruction},
+    instructions::{tagged::TaggedInstruction, Instruction, InstructionOpcode},
     Bytes, Error, Memory, Register, RISCV_PAGESIZE,
 };
+use ckb_vm_definitions::instructions as opcodes;
+use proptest::prelude::*;
 use std::marker::PhantomData;
+
+pub fn rtype_op() -> impl Strategy<Value = InstructionOpcode> {
+    prop::sample::select(vec![opcodes::OP_ADD, opcodes::OP_AND])
+}
 
 pub fn assert_same_tagged(i: &TaggedInstruction, i2: &TaggedInstruction) {
     match (i, i2) {
