@@ -300,14 +300,13 @@ impl<'a> InstrStream<'a> {
                 }
             })
             // Now we exact all valuable terms
-            .map(|l| {
+            .flat_map(|l| {
                 TOKENS_RE
                     .captures_iter(l)
                     .map(|c| c.get(0))
                     .filter(|c| c.is_some())
                     .map(|c| c.unwrap().as_str())
             })
-            .flatten()
             .collect();
 
         Self { tokens, current: 0 }
