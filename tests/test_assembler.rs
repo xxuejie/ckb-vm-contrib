@@ -13,15 +13,10 @@ use utils::*;
 
 fn t<T: Into<TaggedInstruction>>(i: T) {
     let i: TaggedInstruction = i.into();
-    println!("Inst: {}", i);
     let result = assemble::<u64>(&[i.clone()]);
     assert!(result.is_ok(), "Assemble error: {:?}", result.unwrap_err());
     let assemble_result = result.unwrap();
     let mut mem = VecMemory::<u64>::new(assemble_result.clone());
-    println!(
-        "Assembled: {:x}",
-        ckb_vm::Bytes::from(assemble_result.clone())
-    );
 
     let mut decoder = build_decoder::<u64>(ISA_IMC, VERSION1);
     let decode_result = decoder.decode(&mut mem, 0);
