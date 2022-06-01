@@ -84,7 +84,7 @@ fn assemble_utype<R: Register>(i: &Utype) -> Option<u32> {
     match i.op() {
         opcodes::OP_LUI => Some(utype_immediate(i.immediate_s()) | opcode(0b0110111)),
         opcodes::OP_AUIPC => Some(utype_immediate(i.immediate_s()) | opcode(0b0010111)),
-        opcodes::OP_JAL => Some(jtype_immediate(i.immediate_s()) | opcode(0b0110111)),
+        opcodes::OP_JAL => Some(jtype_immediate(i.immediate_s()) | opcode(0b1101111)),
         _ => None,
     }
     .map(|packed| packed | rd(i.rd()))

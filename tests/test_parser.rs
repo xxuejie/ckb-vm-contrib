@@ -1,7 +1,8 @@
 mod utils;
 
-use ckb_vm::instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype};
+use ckb_vm::instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype, Utype};
 use ckb_vm_contrib::assembler::parse;
+use ckb_vm_definitions::instructions as opcodes;
 use proptest::prelude::*;
 use utils::*;
 
@@ -80,5 +81,23 @@ proptest! {
         uimm in 0u32..32u32)
     {
         t(Itype::new_u(op, rs1, rs2, uimm));
+    }
+
+    #[test]
+    fn parse_utype_instruction(
+        op in prop::sample::select(vec![opcodes::OP_LUI, opcodes::OP_AUIPC]),
+        rd in 0usize..32usize,
+        uimm in 0u32..1048576u32)
+    {
+        t(Utype::new(op, rd, uimm << 12));
+    }
+
+
+    #[test]
+    fn parse_jal_instruction(
+        rd in 0usize..32usize,
+        imm in -524288i32..524288i32)
+    {
+        t(Utype::new_s(opcodes::OP_JAL, rd, imm << 1));
     }
 }

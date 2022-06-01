@@ -48,11 +48,10 @@ pub fn itype_immediate(immediate: i32) -> u32 {
 #[inline(always)]
 pub fn jtype_immediate(immediate: i32) -> u32 {
     let i = immediate as u32;
-    let v = (((i >> 20) & 0b1) << 19)
-        | (((i >> 1) & 0b11_1111_1111) << 9)
-        | (((i >> 11) & 0b1) << 8)
-        | (i >> 12) & 0b1111_1111;
-    v << 12
+    (((i >> 20) & 0b1) << 31)
+        | (((i >> 1) & 0b11_1111_1111) << 21)
+        | (((i >> 11) & 0b1) << 20)
+        | (((i >> 12) & 0b1111_1111) << 12)
 }
 
 #[inline(always)]

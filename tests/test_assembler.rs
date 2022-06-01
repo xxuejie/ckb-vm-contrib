@@ -2,20 +2,26 @@ mod utils;
 
 use ckb_vm::{
     decoder::build_decoder,
-    instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype},
+    instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype, Utype},
     machine::VERSION1,
     ISA_IMC,
 };
 use ckb_vm_contrib::assembler::assemble;
+use ckb_vm_definitions::instructions as opcodes;
 use proptest::prelude::*;
 use utils::*;
 
 fn t<T: Into<TaggedInstruction>>(i: T) {
     let i: TaggedInstruction = i.into();
+    println!("Inst: {}", i);
     let result = assemble::<u64>(&[i.clone()]);
     assert!(result.is_ok(), "Assemble error: {:?}", result.unwrap_err());
     let assemble_result = result.unwrap();
     let mut mem = VecMemory::<u64>::new(assemble_result.clone());
+    println!(
+        "Assembled: {:x}",
+        ckb_vm::Bytes::from(assemble_result.clone())
+    );
 
     let mut decoder = build_decoder::<u64>(ISA_IMC, VERSION1);
     let decode_result = decoder.decode(&mut mem, 0);
@@ -99,5 +105,23 @@ proptest! {
         uimm in 0u32..32u32)
     {
         t(Itype::new_u(op, rs1, rs2, uimm));
+    }
+
+    #[test]
+    fn assemble_utype_instruction(
+        op in prop::sample::select(vec![opcodes::OP_LUI, opcodes::OP_AUIPC]),
+        rd in 0usize..32usize,
+        uimm in 0u32..1048576u32)
+    {
+        t(Utype::new(op, rd, uimm << 12));
+    }
+
+
+    #[test]
+    fn assemble_jal_instruction(
+        rd in 0usize..32usize,
+        imm in -524288i32..524288i32)
+    {
+        t(Utype::new_s(opcodes::OP_JAL, rd, imm << 1));
     }
 }
