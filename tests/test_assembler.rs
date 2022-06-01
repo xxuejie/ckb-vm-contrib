@@ -6,29 +6,16 @@ use ckb_vm::{
     machine::VERSION1,
     ISA_IMC,
 };
-use ckb_vm_contrib::assembler::assemble;
+use ckb_vm_contrib::assembler::{assemble, i, m, Assembler};
 use ckb_vm_definitions::instructions as opcodes;
 use proptest::prelude::*;
 use utils::*;
 
 fn t<T: Into<TaggedInstruction>>(i: T) {
     let i: TaggedInstruction = i.into();
-    let result = assemble::<u64>(&[i.clone()]);
-    assert!(result.is_ok(), "Assemble error: {:?}", result.unwrap_err());
-    let assemble_result = result.unwrap();
-    let mut mem = VecMemory::<u64>::new(assemble_result.clone());
 
-    let mut decoder = build_decoder::<u64>(ISA_IMC, VERSION1);
-    let decode_result = decoder.decode(&mut mem, 0);
-    assert!(
-        decode_result.is_ok(),
-        "Decoder error: {:?}",
-        decode_result.unwrap_err()
-    );
-    let i2 = decode_result.unwrap();
-    let i2: TaggedInstruction = i2.try_into().unwrap();
-
-    assert_same_tagged(&i, &i2);
+    t_normal_assemble(&i);
+    t_norvc_assemble(&i);
 }
 
 proptest! {
@@ -83,16 +70,6 @@ proptest! {
     }
 
     #[test]
-    fn assemble_itype_shift_instruction_u32(
-        op in itype_shift_op(),
-        rs1 in 0usize..32usize,
-        rs2 in 0usize..32usize,
-        uimm in 0u32..32u32)
-    {
-        t(Itype::new_u(op, rs1, rs2, uimm));
-    }
-
-    #[test]
     fn assemble_itype_shiftw_instruction(
         op in itype_shiftw_op(),
         rs1 in 0usize..32usize,
@@ -119,4 +96,46 @@ proptest! {
     {
         t(Utype::new_s(opcodes::OP_JAL, rd, imm << 1));
     }
+}
+
+fn t_normal_assemble(i: &TaggedInstruction) {
+    let result = assemble::<u64>(&[i.clone()]);
+    assert!(result.is_ok(), "Assemble error: {:?}", result.unwrap_err());
+    let assemble_result = result.unwrap();
+    let mut mem = VecMemory::<u64>::new(assemble_result.clone());
+
+    let mut decoder = build_decoder::<u64>(ISA_IMC, VERSION1);
+    let decode_result = decoder.decode(&mut mem, 0);
+    assert!(
+        decode_result.is_ok(),
+        "Decoder error: {:?}",
+        decode_result.unwrap_err()
+    );
+    let i2 = decode_result.unwrap();
+    let i2: TaggedInstruction = i2.try_into().unwrap();
+
+    assert_same_tagged(&i, &i2);
+}
+
+fn t_norvc_assemble(i: &TaggedInstruction) {
+    let mut assembler = Assembler::new();
+    assembler.add_assembler_factory(i::assembler::<u64>);
+    assembler.add_assembler_factory(m::assembler::<u64>);
+
+    let result = assembler.assemble(i);
+    assert!(result.is_ok(), "Assemble error: {:?}", result.unwrap_err());
+    let assemble_result = result.unwrap();
+    let mut mem = VecMemory::<u64>::new(assemble_result.clone());
+
+    let mut decoder = build_decoder::<u64>(ISA_IMC, VERSION1);
+    let decode_result = decoder.decode(&mut mem, 0);
+    assert!(
+        decode_result.is_ok(),
+        "Decoder error: {:?}",
+        decode_result.unwrap_err()
+    );
+    let i2 = decode_result.unwrap();
+    let i2: TaggedInstruction = i2.try_into().unwrap();
+
+    assert_same_tagged(&i, &i2);
 }
