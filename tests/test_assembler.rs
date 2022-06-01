@@ -96,6 +96,13 @@ proptest! {
     {
         t(Utype::new_s(opcodes::OP_JAL, rd, imm << 1));
     }
+
+    #[test]
+    fn assemble_system_instruction(
+        op in prop::sample::select(vec![opcodes::OP_ECALL, opcodes::OP_EBREAK]),
+    ) {
+        t(Rtype::new(op, 0, 0, 0));
+    }
 }
 
 fn t_normal_assemble(i: &TaggedInstruction) {

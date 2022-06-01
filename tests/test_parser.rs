@@ -1,14 +1,14 @@
 mod utils;
 
 use ckb_vm::instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype, Utype};
-use ckb_vm_contrib::assembler::parse;
+use ckb_vm_contrib::{assembler::parse, printer::InstructionPrinter};
 use ckb_vm_definitions::instructions as opcodes;
 use proptest::prelude::*;
 use utils::*;
 
 fn t<T: Into<TaggedInstruction>>(i: T) {
     let i: TaggedInstruction = i.into();
-    let text = format!("{}", i);
+    let text = format!("{}", InstructionPrinter::new(i.clone()));
 
     let parse_result = parse(&text);
     assert!(
@@ -99,5 +99,12 @@ proptest! {
         imm in -524288i32..524288i32)
     {
         t(Utype::new_s(opcodes::OP_JAL, rd, imm << 1));
+    }
+
+    #[test]
+    fn parse_system_instruction(
+        op in prop::sample::select(vec![opcodes::OP_ECALL, opcodes::OP_EBREAK]),
+    ) {
+        t(Rtype::new(op, 0, 0, 0));
     }
 }
