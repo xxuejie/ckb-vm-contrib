@@ -10,7 +10,7 @@ fn t<T: Into<TaggedInstruction>>(i: T) {
     let i: TaggedInstruction = i.into();
     let text = format!("{}", InstructionPrinter::new(i.clone()));
 
-    let parse_result = parse(&text);
+    let parse_result = parse::<u64>(&text);
     assert!(
         parse_result.is_ok(),
         "Parser error: {:?}",

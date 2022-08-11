@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 /// Parse RISC-V instructions in text format into ckb-vm instruction formats
-pub fn parse(input: &str) -> Result<Vec<TaggedInstruction>, Error> {
+pub fn parse<R: Register>(input: &str) -> Result<Vec<TaggedInstruction>, Error> {
     let mut insts = Vec::new();
 
     // First, ensure multiple lines are processed correctly
@@ -28,7 +28,8 @@ pub fn parse(input: &str) -> Result<Vec<TaggedInstruction>, Error> {
         if let Some((opcode, f)) = PARSER_FUNCS.get(opcode_name) {
             let inst = f(*opcode, &mut stream)?;
             insts.push(inst);
-        } else if let Some(parsed_insts) = parse_pseudoinstructions(opcode_name, &mut stream)? {
+        } else if let Some(parsed_insts) = parse_pseudoinstructions::<R>(opcode_name, &mut stream)?
+        {
             insts.extend(parsed_insts);
         } else {
             return Err(Error::External(format!(
@@ -258,11 +259,235 @@ fn parse_noarg_rtype(
     Ok(Rtype::new(opcode, 0, 0, 0).into())
 }
 
-fn parse_pseudoinstructions(
+fn parse_pseudoinstructions<R: Register>(
     opcode_name: &str,
     stream: &mut InstrStream,
 ) -> Result<Option<Vec<TaggedInstruction>>, Error> {
     match opcode_name {
+        "lla" => {
+            let rd = stream.next_register()?;
+            let offset = stream.next_number()? as u32;
+            Ok(Some(vec![
+                Utype::new(opcodes::OP_AUIPC, rd, offset >> 12).into(),
+                Itype::new_u(opcodes::OP_ADDI, rd, rd, offset & 0xFFF).into(),
+            ]))
+        }
+        "nop" => Ok(Some(vec![Itype::new_u(opcodes::OP_ADDI, 0, 0, 0).into()])),
+        "li" => {
+            let rd = stream.next_register()?;
+            let imm = stream.next_number_with_mask(0xFFF)?;
+            Ok(Some(vec![Itype::new_u(
+                opcodes::OP_ADDI,
+                rd,
+                0,
+                imm as u32,
+            )
+            .into()]))
+        }
+        "mv" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![Itype::new_u(opcodes::OP_ADDI, rd, rs, 0).into()]))
+        }
+        "not" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(
+                vec![Itype::new_s(opcodes::OP_XORI, rd, rs, -1).into()],
+            ))
+        }
+        "neg" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![Rtype::new(opcodes::OP_SUB, rd, 0, rs).into()]))
+        }
+        "negw" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![Rtype::new(opcodes::OP_SUBW, rd, 0, rs).into()]))
+        }
+        "sext.b" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![
+                Itype::new_u(opcodes::OP_SLLI, rd, rs, R::BITS as u32 - 8).into(),
+                Itype::new_u(opcodes::OP_SRAI, rd, rd, R::BITS as u32 - 8).into(),
+            ]))
+        }
+        "sext.h" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![
+                Itype::new_u(opcodes::OP_SLLI, rd, rs, R::BITS as u32 - 16).into(),
+                Itype::new_u(opcodes::OP_SRAI, rd, rd, R::BITS as u32 - 16).into(),
+            ]))
+        }
+        "sext.w" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(
+                vec![Itype::new_u(opcodes::OP_ADDIW, rd, rs, 0).into()],
+            ))
+        }
+        "zext.b" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![
+                Itype::new_u(opcodes::OP_ANDI, rd, rs, 255).into()
+            ]))
+        }
+        "zext.h" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![
+                Itype::new_u(opcodes::OP_SLLI, rd, rs, R::BITS as u32 - 16).into(),
+                Itype::new_u(opcodes::OP_SRLI, rd, rd, R::BITS as u32 - 16).into(),
+            ]))
+        }
+        "zext.w" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![
+                Itype::new_u(opcodes::OP_SLLI, rd, rs, R::BITS as u32 - 32).into(),
+                Itype::new_u(opcodes::OP_SRLI, rd, rd, R::BITS as u32 - 32).into(),
+            ]))
+        }
+        "seqz" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(
+                vec![Itype::new_u(opcodes::OP_SLTIU, rd, rs, 1).into()],
+            ))
+        }
+        "snez" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![Rtype::new(opcodes::OP_SLTU, rd, 0, rs).into()]))
+        }
+        "sltz" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![Rtype::new(opcodes::OP_SLT, rd, rs, 0).into()]))
+        }
+        "sgtz" => {
+            let rd = stream.next_register()?;
+            let rs = stream.next_register()?;
+            Ok(Some(vec![Rtype::new(opcodes::OP_SLT, rd, 0, rs).into()]))
+        }
+        "beqz" => {
+            let rs = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BEQ,
+                offset as u32 >> 1,
+                rs,
+                0,
+            )
+            .into()]))
+        }
+        "bnez" => {
+            let rs = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BNE,
+                offset as u32 >> 1,
+                rs,
+                0,
+            )
+            .into()]))
+        }
+        "blez" => {
+            let rs = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BGE,
+                offset as u32 >> 1,
+                0,
+                rs,
+            )
+            .into()]))
+        }
+        "bgez" => {
+            let rs = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BGE,
+                offset as u32 >> 1,
+                rs,
+                0,
+            )
+            .into()]))
+        }
+        "bltz" => {
+            let rs = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BLT,
+                offset as u32 >> 1,
+                rs,
+                0,
+            )
+            .into()]))
+        }
+        "bgtz" => {
+            let rs = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BLT,
+                offset as u32 >> 1,
+                0,
+                rs,
+            )
+            .into()]))
+        }
+        "bgt" => {
+            let rs = stream.next_register()?;
+            let rt = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BLT,
+                offset as u32 >> 1,
+                rt,
+                rs,
+            )
+            .into()]))
+        }
+        "ble" => {
+            let rs = stream.next_register()?;
+            let rt = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BGE,
+                offset as u32 >> 1,
+                rt,
+                rs,
+            )
+            .into()]))
+        }
+        "bgtu" => {
+            let rs = stream.next_register()?;
+            let rt = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BLTU,
+                offset as u32 >> 1,
+                rt,
+                rs,
+            )
+            .into()]))
+        }
+        "bleu" => {
+            let rs = stream.next_register()?;
+            let rt = stream.next_register()?;
+            let offset = stream.next_number_with_mask(0x1FFE)?;
+            Ok(Some(vec![Stype::new_u(
+                opcodes::OP_BGEU,
+                offset as u32 >> 1,
+                rt,
+                rs,
+            )
+            .into()]))
+        }
         "j" => Ok(Some(vec![Utype::new(
             opcodes::OP_JAL,
             0,
@@ -388,6 +613,15 @@ impl<'a> InstrStream<'a> {
 
     fn next_number(&mut self) -> Result<u64, Error> {
         let number = self.peek_number()?;
+        self.current += 1;
+        Ok(number)
+    }
+
+    fn next_number_with_mask(&mut self, mask: u64) -> Result<u64, Error> {
+        let number = self.peek_number()?;
+        if number & (!mask) != 0 {
+            return Err(Error::External(format!("Cannot encode number: {}", number)));
+        }
         self.current += 1;
         Ok(number)
     }
