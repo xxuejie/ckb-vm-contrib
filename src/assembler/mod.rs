@@ -150,12 +150,12 @@ lazy_static! {
         m.insert("remu", (opcodes::OP_REMU, parse_rtype as ParserFunc));
         m.insert("remuw", (opcodes::OP_REMUW, parse_rtype as ParserFunc));
         // S type
-        m.insert("beq", (opcodes::OP_BEQ, parse_stype as ParserFunc));
-        m.insert("bne", (opcodes::OP_BNE, parse_stype as ParserFunc));
-        m.insert("blt", (opcodes::OP_BLT, parse_stype as ParserFunc));
-        m.insert("bge", (opcodes::OP_BGE, parse_stype as ParserFunc));
-        m.insert("bltu", (opcodes::OP_BLTU, parse_stype as ParserFunc));
-        m.insert("bgeu", (opcodes::OP_BGEU, parse_stype as ParserFunc));
+        m.insert("beq", (opcodes::OP_BEQ, parse_btype as ParserFunc));
+        m.insert("bne", (opcodes::OP_BNE, parse_btype as ParserFunc));
+        m.insert("blt", (opcodes::OP_BLT, parse_btype as ParserFunc));
+        m.insert("bge", (opcodes::OP_BGE, parse_btype as ParserFunc));
+        m.insert("bltu", (opcodes::OP_BLTU, parse_btype as ParserFunc));
+        m.insert("bgeu", (opcodes::OP_BGEU, parse_btype as ParserFunc));
         m.insert("sb", (opcodes::OP_SB, parse_stype as ParserFunc));
         m.insert("sh", (opcodes::OP_SH, parse_stype as ParserFunc));
         m.insert("sw", (opcodes::OP_SW, parse_stype as ParserFunc));
@@ -212,6 +212,30 @@ fn parse_rtype(
     let rs1 = stream.next_register()?;
     let rs2 = stream.next_register()?;
     Ok(Rtype::new(opcode, rd, rs1, rs2).into())
+}
+
+fn parse_btype(
+    opcode: InstructionOpcode,
+    stream: &mut InstrStream,
+) -> Result<TaggedInstruction, Error> {
+    let rs1 = stream.next_register()?;
+    let (rs2, immediate) = match (stream.peek_register(), stream.peek_number()) {
+        (Ok(rs2), _) => {
+            stream.next_token()?;
+            (rs2, stream.next_number()?)
+        }
+        (_, Ok(immediate)) => {
+            stream.next_token()?;
+            (stream.next_register()?, immediate)
+        }
+        _ => {
+            return Err(Error::External(format!(
+                "Invalid token: {}",
+                stream.peek_token()?
+            )))
+        }
+    };
+    Ok(Stype::new_u(opcode, immediate as u32, rs1, rs2).into())
 }
 
 fn parse_stype(
