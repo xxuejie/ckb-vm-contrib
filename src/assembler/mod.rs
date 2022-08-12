@@ -219,10 +219,10 @@ fn parse_stype(
     stream: &mut InstrStream,
 ) -> Result<TaggedInstruction, Error> {
     let rs1 = stream.next_register()?;
-    let (rs2, immediate) = match (stream.peek_register(), stream.peek_number()) {
-        (Ok(rs2), _) => {
+    let (rd, immediate) = match (stream.peek_register(), stream.peek_number()) {
+        (Ok(rd), _) => {
             stream.next_token()?;
-            (rs2, stream.next_number()?)
+            (rd, stream.next_number()?)
         }
         (_, Ok(immediate)) => {
             stream.next_token()?;
@@ -235,7 +235,7 @@ fn parse_stype(
             )))
         }
     };
-    Ok(Stype::new_u(opcode, immediate as u32, rs1, rs2).into())
+    Ok(Stype::new_u(opcode, immediate as u32, rd, rs1).into())
 }
 
 fn parse_utype(
