@@ -9,10 +9,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# ckb-vm = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "c496f70" }
-# ckb-vm-definitions = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "c496f70" }
-ckb-vm = "0.21.3"
-ckb-vm-definitions = "0.21.3"
+ckb-vm = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "21f353d" }
+ckb-vm-definitions = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "21f353d" }
 lazy_static = "1.4.0"
 regex = "1.5.4"
 
