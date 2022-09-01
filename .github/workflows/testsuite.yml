@@ -1,0 +1,28 @@
+name: test-suite
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install riscv toolchain
+      run: sudo apt-get update && sudo apt-get -y install gcc-riscv64-unknown-elf
+    - name: Clone test suite
+      run: git clone --recursive https://github.com/xxuejie/ckb-vm-contrib-test-suite
+    - name: Change directory
+      run: cd ckb-vm-contrib-test-suite
+    - name: Symbolic link ckb-vm-contrib
+      run: ln -s .. ckb-vm-contrib
+    - name: Run test suite
+      run: RISCV=/usr ./test.sh
