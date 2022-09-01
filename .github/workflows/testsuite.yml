@@ -1,0 +1,24 @@
+name: test-suite
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-20.04
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install riscv toolchain
+      run: sudo docker run --rm -v `pwd`:/code nervos/ckb-riscv-gnu-toolchain:bionic-20211214 cp -r /riscv /code/riscv
+    - name: Clone test suite
+      run: git clone --recursive https://github.com/xxuejie/ckb-vm-contrib-test-suite
+    - name: Run test suite
+      run: cd ckb-vm-contrib-test-suite && ln -s .. ckb-vm-contrib && RISCV=`pwd`/../riscv ./test.sh
