@@ -20,9 +20,5 @@ jobs:
       run: sudo apt-get update && sudo apt-get -y install gcc-riscv64-unknown-elf
     - name: Clone test suite
       run: git clone --recursive https://github.com/xxuejie/ckb-vm-contrib-test-suite
-    - name: Change directory
-      run: cd ckb-vm-contrib-test-suite
-    - name: Symbolic link ckb-vm-contrib
-      run: ln -s .. ckb-vm-contrib
     - name: Run test suite
-      run: RISCV=/usr ./test.sh
+      run: cd ckb-vm-contrib-test-suite && ln -s .. ckb-vm-contrib && RISCV=/usr ./test.sh
