@@ -3,6 +3,8 @@ use ckb_vm::{
     Error, Machine, Memory, Register, RISCV_GENERAL_REGISTER_NUMBER,
 };
 
+pub const PC_INDEX: usize = 0xFFFF;
+
 /// An interpreter function for CKB-VM's AST value, which might be super
 /// helpful in terms of debugging.
 pub fn interpret<Mac: Machine>(value: &Value, machine: &mut Mac) -> Result<Mac::REG, Error> {
@@ -11,6 +13,8 @@ pub fn interpret<Mac: Machine>(value: &Value, machine: &mut Mac) -> Result<Mac::
         Value::Register(index) => {
             if *index < RISCV_GENERAL_REGISTER_NUMBER {
                 Ok(machine.registers()[*index].clone())
+            } else if *index == PC_INDEX {
+                Ok(machine.pc().clone())
             } else {
                 Err(Error::External(format!(
                     "Invalid register index: {}",
