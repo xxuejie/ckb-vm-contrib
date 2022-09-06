@@ -18,7 +18,9 @@ jobs:
     - uses: actions/checkout@v3
     - name: Install riscv toolchain
       run: sudo docker run --rm -v `pwd`:/code nervos/ckb-riscv-gnu-toolchain:bionic-20211214 cp -r /riscv /code/riscv
+    - name: Install llvm 14
+      run: wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 14 all
     - name: Clone test suite
-      run: git clone --recursive https://github.com/xxuejie/ckb-vm-contrib-test-suite
+      run: git clone https://github.com/xxuejie/ckb-vm-contrib-test-suite && cd ckb-vm-contrib-test-suite && git checkout a778c08d9511821a7ac1be6931f9b0ee8b40fb86 && git submodule update --init --recursive
     - name: Run test suite
       run: cd ckb-vm-contrib-test-suite && ln -s .. ckb-vm-contrib && RISCV=`pwd`/../riscv ./test.sh
