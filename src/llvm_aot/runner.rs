@@ -4,7 +4,7 @@ use super::{
 };
 use ckb_vm::{
     decoder::{build_decoder, Decoder},
-    instructions::execute,
+    instructions::{execute, is_basic_block_end_instruction},
     machine::{DefaultMachine, DefaultMachineBuilder},
     memory::{fill_page_data, memset, round_page_down, round_page_up, FLAG_EXECUTABLE},
     Bytes, CoreMachine, Error, Machine, Memory, SupportMachine,
@@ -17,9 +17,14 @@ use std::slice::from_raw_parts_mut;
 
 const RUNTIME_FLAG_RUNNING: u8 = 1;
 
-pub const EXIT_REASON_UNKNOWN_ADDRESS: u8 = 1;
-pub const EXIT_REASON_ECALL: u8 = 2;
-pub const EXIT_REASON_EBREAK: u8 = 3;
+pub const EXIT_REASON_ECALL_UNREACHABLE: u8 = 1;
+pub const EXIT_REASON_EBREAK_UNREACHABLE: u8 = 2;
+pub const EXIT_REASON_UNKNOWN_BLOCK: u8 = 3;
+pub const EXIT_REASON_UNKNOWN_PC_VALUE: u8 = 4;
+pub const EXIT_REASON_UNKNOWN_RESUME_ADDRESS: u8 = 5;
+pub const EXIT_REASON_MALFORMED_RETURN: u8 = 6;
+pub const EXIT_REASON_MALFORMED_INDIRECT_CALL: u8 = 7;
+pub const EXIT_REASON_BARE_CALL_EXIT: u8 = 101;
 
 pub struct LlvmAotMachine {
     pub machine: DefaultMachine<LlvmAotCoreMachine>,
@@ -28,6 +33,84 @@ pub struct LlvmAotMachine {
     // Mapping from RISC-V function entry to host function entry
     pub function_mapping: HashMap<u64, u64>,
     pub entry_function: EntryFunctionType,
+
+    pub decoder: Decoder,
+    pub bare_call_error: Option<Error>,
+}
+
+#[repr(C)]
+pub struct LlvmAotMachineEnv {
+    pub data: *mut LlvmAotMachine,
+    pub ecall: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
+    pub ebreak: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
+    pub query_function: unsafe extern "C" fn(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64,
+    pub interpret: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
+}
+
+unsafe extern "C" fn bare_ecall(m: *mut LlvmAotMachine) -> u64 {
+    let m = &mut *m;
+    match m.machine.ecall() {
+        Ok(()) => {
+            if m.machine.running() {
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            m.bare_call_error = Some(e);
+            0
+        }
+    }
+}
+
+unsafe extern "C" fn bare_ebreak(m: *mut LlvmAotMachine) -> u64 {
+    let m = &mut *m;
+    match m.machine.ebreak() {
+        Ok(()) => {
+            if m.machine.running() {
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            m.bare_call_error = Some(e);
+            0
+        }
+    }
+}
+
+unsafe extern "C" fn bare_query_function(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64 {
+    let m = &*m;
+    *m.function_mapping
+        .get(&riscv_addr)
+        .unwrap_or(&u64::max_value())
+}
+
+unsafe extern "C" fn bare_interpret(m: *mut LlvmAotMachine) -> u64 {
+    let mut m = &mut *m;
+    match inner_interpret(&mut m) {
+        Ok(block_end) => block_end,
+        Err(e) => {
+            m.bare_call_error = Some(e);
+            0
+        }
+    }
+}
+
+fn inner_interpret(m: &mut LlvmAotMachine) -> Result<u64, Error> {
+    while m.machine.running() {
+        let pc = *m.machine.pc();
+        let instruction = m.decoder.decode(m.machine.memory_mut(), pc)?;
+        execute(instruction, &mut m.machine)?;
+
+        if is_basic_block_end_instruction(instruction) {
+            return Ok(*m.machine.pc());
+        }
+    }
+    // Terminating
+    Ok(0)
 }
 
 impl LlvmAotMachine {
@@ -55,11 +138,15 @@ impl LlvmAotMachine {
             .map(|table| (table.riscv_addr, table.host_addr))
             .collect();
 
+        let decoder = build_decoder::<u64>(machine.isa(), machine.version());
+
         Ok(Self {
             machine,
             code_hash,
             function_mapping,
             entry_function: aot_symbols.entry_function,
+            bare_call_error: None,
+            decoder,
         })
     }
 
@@ -75,34 +162,65 @@ impl LlvmAotMachine {
         self.machine.load_program(program, args)
     }
 
-    pub fn run(&mut self) -> Result<i8, Error> {
-        let mut decoder = build_decoder::<u64>(self.machine.isa(), self.machine.version());
+    pub fn run(&mut self, fast_mode: bool) -> Result<i8, Error> {
         self.machine.set_running(true);
         while self.machine.running() {
             let pc = *self.machine.pc();
             if let Some(host_function) = self.function_mapping.get(&pc) {
-                // Clear previous last_ra value, which should now be invalid.
-                self.machine.inner_mut().data.last_ra = 0;
-                let result = unsafe {
-                    (self.entry_function)(&mut self.machine.inner_mut().data, *host_function)
+                let result = {
+                    // Clear previous last_ra value, which should now be invalid.
+                    self.machine.inner_mut().data.last_ra = 0;
+                    let env = self.env();
+                    self.machine.inner_mut().data.env = &env;
+                    unsafe {
+                        (self.entry_function)(&mut self.machine.inner_mut().data, *host_function)
+                    }
                 };
+                if let Some(e) = &self.bare_call_error {
+                    return Err(e.clone());
+                }
                 match result {
-                    EXIT_REASON_UNKNOWN_ADDRESS => (),
-                    EXIT_REASON_ECALL => self.machine.ecall()?,
-                    EXIT_REASON_EBREAK => self.machine.ebreak()?,
+                    EXIT_REASON_ECALL_UNREACHABLE
+                    | EXIT_REASON_EBREAK_UNREACHABLE
+                    | EXIT_REASON_UNKNOWN_BLOCK
+                    | EXIT_REASON_UNKNOWN_PC_VALUE
+                    | EXIT_REASON_UNKNOWN_RESUME_ADDRESS
+                    | EXIT_REASON_MALFORMED_RETURN
+                    | EXIT_REASON_MALFORMED_INDIRECT_CALL => (),
+                    EXIT_REASON_BARE_CALL_EXIT => {
+                        if self.machine.running() {
+                            return Err(Error::External(
+                                "Machine is still running but bare call triggers exiting!"
+                                    .to_string(),
+                            ));
+                        }
+                    }
                     _ => return Err(Error::Asm(result)),
                 }
+                if fast_mode && self.machine.running() {
+                    return Err(Error::External(format!("Fast mode exit with: {}", result)));
+                }
             } else {
-                self.step(&mut decoder)?;
+                self.step()?;
             }
         }
         Ok(self.machine.exit_code())
     }
 
-    pub fn step(&mut self, decoder: &mut Decoder) -> Result<(), Error> {
+    pub fn step(&mut self) -> Result<(), Error> {
         let pc = *self.machine.pc();
-        let instruction = decoder.decode(self.machine.memory_mut(), pc)?;
+        let instruction = self.decoder.decode(self.machine.memory_mut(), pc)?;
         execute(instruction, &mut self.machine)
+    }
+
+    fn env(&self) -> LlvmAotMachineEnv {
+        LlvmAotMachineEnv {
+            data: self as *const LlvmAotMachine as *mut LlvmAotMachine,
+            ecall: bare_ecall,
+            ebreak: bare_ebreak,
+            query_function: bare_query_function,
+            interpret: bare_interpret,
+        }
     }
 }
 
@@ -116,6 +234,8 @@ pub struct LlvmAotCoreMachineData {
     pub runtime_flags: u8,
     pub exit_aot_reason: u8,
     pub jmpbuf: [u64; 5],
+
+    pub env: *const LlvmAotMachineEnv,
 }
 
 pub struct LlvmAotCoreMachine {
@@ -145,6 +265,7 @@ impl LlvmAotCoreMachine {
             runtime_flags: 0,
             exit_aot_reason: 0,
             jmpbuf: [0u64; 5],
+            env: ptr::null(),
         };
 
         Ok(Self {

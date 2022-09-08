@@ -3,7 +3,11 @@ use super::{
     macros::*,
     preprocessor::{preprocess, Func},
     runner::{
-        LlvmAotCoreMachineData, EXIT_REASON_EBREAK, EXIT_REASON_ECALL, EXIT_REASON_UNKNOWN_ADDRESS,
+        LlvmAotCoreMachineData, LlvmAotMachineEnv, EXIT_REASON_BARE_CALL_EXIT,
+        EXIT_REASON_EBREAK_UNREACHABLE, EXIT_REASON_ECALL_UNREACHABLE,
+        EXIT_REASON_MALFORMED_INDIRECT_CALL, EXIT_REASON_MALFORMED_RETURN,
+        EXIT_REASON_UNKNOWN_BLOCK, EXIT_REASON_UNKNOWN_PC_VALUE,
+        EXIT_REASON_UNKNOWN_RESUME_ADDRESS,
     },
     utils::cs,
 };
@@ -45,6 +49,8 @@ pub struct LlvmCompilingMachine {
     emitted_funcs: HashMap<u64, LLVMValueRef>,
     // RISC-V early exit function
     exit_func: LLVMValueRef,
+    // Wrapper to call into Rust FFI functions
+    ffi_wrapper_func: LLVMValueRef,
 }
 
 extern "C" {
@@ -118,6 +124,7 @@ impl LlvmCompilingMachine {
             symbol_prefix: symbol_prefix.to_string(),
             // This will be updated in emit function
             exit_func: ptr::null_mut(),
+            ffi_wrapper_func: ptr::null_mut(),
         })
     }
 
@@ -265,6 +272,33 @@ impl LlvmCompilingMachine {
             LLVMCallConv::LLVMHHVMCallConv as u32
         ));
 
+        self.ffi_wrapper_func = assert_llvm_create!(
+            LLVMAddFunction(
+                self.module,
+                cs(&format!("{}____ffi_wrapper____", self.symbol_prefix))?.as_ptr(),
+                self.ffi_wrapper_function_type()?,
+            ),
+            "create ffi function"
+        );
+        let align_stack_attr_id = u!(LLVMGetEnumAttributeKindForName(
+            b"alignstack\0".as_ptr() as *const _,
+            10
+        ));
+        if align_stack_attr_id == 0 {
+            return Err(Error::External(
+                "LLVM is missing alignstack attr!".to_string(),
+            ));
+        }
+        let align_stack_attr = assert_llvm_create!(
+            LLVMCreateEnumAttribute(self.context, align_stack_attr_id, 16),
+            "create alignstack attr"
+        );
+        u!(LLVMAddAttributeAtIndex(
+            self.ffi_wrapper_func,
+            u32::max_value(),
+            align_stack_attr,
+        ));
+
         // Build the actual function bodies
         for func in mem::replace(&mut self.funcs, Vec::new()) {
             self.emit_riscv_func(&func)?;
@@ -272,6 +306,7 @@ impl LlvmCompilingMachine {
 
         self.emit_entry()?;
         self.emit_exit()?;
+        self.emit_ffi_wrapper()?;
 
         if optimize {
             u!(LLVMRunPassManager(self.pass, self.module));
@@ -387,17 +422,7 @@ impl LlvmCompilingMachine {
         ));
 
         u!(LLVMPositionBuilderAtEnd(self.builder, call_block));
-        let vars = TransientValues::new(|mapping| match mapping {
-            Mapping::Pointer => Ok(machine),
-            Mapping::Pc => {
-                let offset = offset_of!(LlvmAotCoreMachineData, pc);
-                self.emit_load_from_machine(machine, offset, i64t, Some("pc"))
-            }
-            Mapping::Register(r) => {
-                let offset = offset_of!(LlvmAotCoreMachineData, registers) + r * 8;
-                self.emit_load_from_machine(machine, offset, i64t, Some(&format!("{}", mapping)))
-            }
-        })?;
+        let vars = self.emit_setup(machine)?;
 
         let target_type = self.riscv_function_type()?;
         let target_pt = assert_llvm_create!(LLVMPointerType(target_type, 0), "target type");
@@ -482,6 +507,24 @@ impl LlvmCompilingMachine {
             ),
             "create longjmp function"
         );
+        let noreturn_attr_id = u!(LLVMGetEnumAttributeKindForName(
+            b"noreturn\0".as_ptr() as *const _,
+            8
+        ));
+        if noreturn_attr_id == 0 {
+            return Err(Error::External(
+                "LLVM is missing noreturn attr!".to_string(),
+            ));
+        }
+        let noreturn_attr = assert_llvm_create!(
+            LLVMCreateEnumAttribute(self.context, noreturn_attr_id, 0),
+            "create alignstack attr"
+        );
+        u!(LLVMAddAttributeAtIndex(
+            longjmp_func,
+            u32::max_value(),
+            noreturn_attr,
+        ));
 
         let exit_function = self.exit_func;
 
@@ -545,6 +588,111 @@ impl LlvmCompilingMachine {
         Ok(())
     }
 
+    // Emit a wrapper function handling environment requirements for calling Rust
+    // funcs via FFI. At the moment, the only such requirement is to align the stack
+    // at 16 bytes, which has already been taken care of by the function attributes.
+    // One possible alternative, is to require all AOTed functions to align on 16 byte
+    // boundary. We actually tried this path, but the problem is: LLVM's alignment code
+    // is quite straightforward in that it always pollute rbp, while HHVM calling
+    // convention uses rbp as an input argument as well as returned result, causing
+    // incorrect code to be generated. That's why we settled on this FFI wrapper function.
+    fn emit_ffi_wrapper(&mut self) -> Result<(), Error> {
+        let entry_block = assert_llvm_create!(
+            LLVMAppendBasicBlockInContext(
+                self.context,
+                self.ffi_wrapper_func,
+                b"__entry_block__\0".as_ptr() as *const _,
+            ),
+            "create ffi wrapper entry block"
+        );
+        u!(LLVMPositionBuilderAtEnd(self.builder, entry_block));
+
+        let func = u!(LLVMGetParam(self.ffi_wrapper_func, 0));
+        let env = u!(LLVMGetParam(self.ffi_wrapper_func, 1));
+        let arg = u!(LLVMGetParam(self.ffi_wrapper_func, 2));
+
+        let mut args = [env, arg];
+        let result = u!(LLVMBuildCall2(
+            self.builder,
+            self.ffi_function_type()?,
+            func,
+            args.as_mut_ptr(),
+            args.len() as u32,
+            b"wrapper_call_result\0".as_ptr() as *const _,
+        ));
+        u!(LLVMBuildRet(self.builder, result));
+
+        Ok(())
+    }
+
+    // Emit a FFI call, also check the return result, when error happens,
+    // emit early exit function.
+    fn emit_ffi_call(
+        &mut self,
+        machine: LLVMValueRef,
+        function: LLVMValueRef,
+        allocas: &RegAllocas,
+        args: &mut [LLVMValueRef; 3],
+        side_effect: bool,
+        name: Option<&str>,
+    ) -> Result<LLVMValueRef, Error> {
+        let name = name.unwrap_or("ffi_call_result");
+
+        if side_effect {
+            self.emit_cleanup(&allocas.load_values()?)?;
+        }
+
+        let result = u!(LLVMBuildCall2(
+            self.builder,
+            self.ffi_wrapper_function_type()?,
+            self.ffi_wrapper_func,
+            args.as_mut_ptr(),
+            args.len() as u32,
+            cs(name)?.as_ptr(),
+        ));
+
+        if side_effect {
+            allocas.store_values(&self.emit_setup(machine)?)?;
+        }
+
+        let success_block = assert_llvm_create!(
+            LLVMCreateBasicBlockInContext(
+                self.context,
+                cs(&format!("{}_success_block", name))?.as_ptr(),
+            ),
+            "create success block"
+        );
+        u!(LLVMAppendExistingBasicBlock(function, success_block));
+        let failure_block = assert_llvm_create!(
+            LLVMCreateBasicBlockInContext(
+                self.context,
+                cs(&format!("{}_failure_block", name))?.as_ptr(),
+            ),
+            "create failure block"
+        );
+        u!(LLVMAppendExistingBasicBlock(function, failure_block));
+
+        let cmp = u!(LLVMBuildICmp(
+            self.builder,
+            LLVMIntPredicate::LLVMIntNE,
+            result,
+            LLVMConstInt(self.i64t()?, 0, 0),
+            cs(&format!("{}_ne_zero", name))?.as_ptr(),
+        ));
+        u!(LLVMBuildCondBr(
+            self.builder,
+            cmp,
+            success_block,
+            failure_block,
+        ));
+        u!(LLVMPositionBuilderAtEnd(self.builder, failure_block));
+        self.emit_call_exit(machine, EXIT_REASON_BARE_CALL_EXIT, &allocas)?;
+
+        u!(LLVMPositionBuilderAtEnd(self.builder, success_block));
+
+        Ok(result)
+    }
+
     // Emit a RISC-V function
     fn emit_riscv_func(&mut self, func: &Func) -> Result<LLVMValueRef, Error> {
         if func.basic_blocks.is_empty() {
@@ -567,6 +715,7 @@ impl LlvmCompilingMachine {
             ),
             "create basic block"
         );
+
         let basic_blocks: HashMap<u64, LLVMBasicBlockRef> = {
             let mut bbs = HashMap::default();
 
@@ -613,27 +762,34 @@ impl LlvmCompilingMachine {
                 Ok(var)
             })?;
 
-            RegAllocas(alloca_args)
+            RegAllocas::new(alloca_args, self.builder, self.i64t()?)
         };
+        let pc_alloca = vars.pc_alloca()?;
+
+        // Build one memory_start construct per function
+        let memory_start = self.emit_load_from_machine(
+            machine,
+            offset_of!(LlvmAotCoreMachineData, memory),
+            i64t,
+            Some("memory_start"),
+        )?;
+
+        let indirect_dispatch_test_alloca = u!(LLVMBuildAlloca(
+            self.builder,
+            i64t,
+            b"indirect_dispatch_test_alloca\0".as_ptr() as *const _,
+        ));
 
         // Jump to the first actual basic block
         u!(LLVMBuildBr(self.builder, basic_blocks[&func.range.start]));
 
+        let mut control_blocks: HashMap<u64, LLVMBasicBlockRef> = HashMap::default();
         // Emit code for each basic block
         for block in &func.basic_blocks {
             u!(LLVMPositionBuilderAtEnd(
                 self.builder,
                 basic_blocks[&block.range.start]
             ));
-
-            // Build one memory_start construct per block, we might optimize this
-            // in the future.
-            let memory_start = self.emit_load_from_machine(
-                machine,
-                offset_of!(LlvmAotCoreMachineData, memory),
-                i64t,
-                Some("memory_start"),
-            )?;
 
             // Emit normal register writes, memory writes
             for (i, write_batch) in block.write_batches.iter().enumerate() {
@@ -649,7 +805,6 @@ impl LlvmCompilingMachine {
             }
 
             // Update PC & writes together with PC
-            let pc_alloca = vars.0.extract_pc()?;
             let next_pc = self.emit_value(
                 machine,
                 memory_start,
@@ -669,6 +824,35 @@ impl LlvmCompilingMachine {
                 )?;
             }
             u!(LLVMBuildStore(self.builder, next_pc, pc_alloca));
+
+            let control_block = assert_llvm_create!(
+                LLVMCreateBasicBlockInContext(
+                    self.context,
+                    cs(&format!("control_block_0x{:x}", block.range.start))?.as_ptr() as *const _
+                ),
+                "create control basic block"
+            );
+            u!(LLVMAppendExistingBasicBlock(function, control_block));
+
+            u!(LLVMBuildBr(self.builder, control_block));
+
+            control_blocks.insert(block.range.start, control_block);
+        }
+
+        let mut indirect_dispatch_block = None;
+        // Emit code for each control block
+        for block in &func.basic_blocks {
+            u!(LLVMPositionBuilderAtEnd(
+                self.builder,
+                control_blocks[&block.range.start]
+            ));
+
+            let next_pc = u!(LLVMBuildLoad2(
+                self.builder,
+                i64t,
+                pc_alloca,
+                b"target_pc\0".as_ptr() as *const _,
+            ));
 
             // Emit control flow changes, there might be several cases:
             // 1(a). Simple jump to another basic block, note this includes fallthroughs;
@@ -691,7 +875,7 @@ impl LlvmCompilingMachine {
                             // 1(a)
                             u!(LLVMBuildBr(self.builder, *target_block));
                         } else {
-                            self.emit_call_exit(machine, EXIT_REASON_UNKNOWN_ADDRESS, &vars)?;
+                            self.emit_call_exit(machine, EXIT_REASON_UNKNOWN_BLOCK, &vars)?;
                         }
                         terminated = true;
                     }
@@ -722,7 +906,74 @@ impl LlvmCompilingMachine {
                         }
                     }
                     _ => {
-                        self.emit_call_exit(machine, EXIT_REASON_UNKNOWN_ADDRESS, &vars)?;
+                        // Indirect jump here. Use interpreter to execute till next basic
+                        // block end.
+                        if indirect_dispatch_block.is_none() {
+                            indirect_dispatch_block = Some(self.emit_indirect_dispatch_block(
+                                machine,
+                                function,
+                                &vars,
+                                indirect_dispatch_test_alloca,
+                                &basic_blocks,
+                            )?);
+                        }
+                        let (interpret_function, data) = self.emit_env_ffi_function(
+                            machine,
+                            offset_of!(LlvmAotMachineEnv, interpret),
+                        )?;
+                        let mut interpret_args =
+                            [interpret_function, data, u!(LLVMConstInt(i64t, 0, 0))];
+                        let interpret_result = self.emit_ffi_call(
+                            machine,
+                            function,
+                            &vars,
+                            &mut interpret_args,
+                            true,
+                            Some("interpret_function_result"),
+                        )?;
+
+                        let ret_block = assert_llvm_create!(
+                            LLVMCreateBasicBlockInContext(
+                                self.context,
+                                b"indirect_ret_block\0".as_ptr() as *const _,
+                            ),
+                            "create ret block"
+                        );
+                        u!(LLVMAppendExistingBasicBlock(function, ret_block));
+                        let jump_block = assert_llvm_create!(
+                            LLVMCreateBasicBlockInContext(
+                                self.context,
+                                b"indirect_jump_block\0".as_ptr() as *const _,
+                            ),
+                            "create jump block"
+                        );
+                        u!(LLVMAppendExistingBasicBlock(function, jump_block));
+
+                        let last_ra_val = self.emit_load_from_machine(
+                            machine,
+                            offset_of!(LlvmAotCoreMachineData, last_ra),
+                            i64t,
+                            Some("last_ra"),
+                        )?;
+                        let cmp = u!(LLVMBuildICmp(
+                            self.builder,
+                            LLVMIntPredicate::LLVMIntEQ,
+                            interpret_result,
+                            last_ra_val,
+                            b"pc_cmp_last_ra\0".as_ptr() as *const _,
+                        ));
+                        u!(LLVMBuildCondBr(self.builder, cmp, ret_block, jump_block));
+
+                        u!(LLVMPositionBuilderAtEnd(self.builder, ret_block));
+                        self.emit_riscv_return(&vars)?;
+
+                        u!(LLVMPositionBuilderAtEnd(self.builder, jump_block));
+                        u!(LLVMBuildStore(
+                            self.builder,
+                            interpret_result,
+                            indirect_dispatch_test_alloca,
+                        ));
+                        u!(LLVMBuildBr(self.builder, indirect_dispatch_block.unwrap()));
                         terminated = true;
                     }
                 },
@@ -739,10 +990,203 @@ impl LlvmCompilingMachine {
                         if let Some(resume_block) = basic_blocks.get(&resume_address) {
                             u!(LLVMBuildBr(self.builder, *resume_block));
                         } else {
-                            self.emit_call_exit(machine, EXIT_REASON_UNKNOWN_ADDRESS, &vars)?;
+                            self.emit_call_exit(
+                                machine,
+                                EXIT_REASON_UNKNOWN_RESUME_ADDRESS,
+                                &vars,
+                            )?;
                         }
                         terminated = true;
                     }
+                }
+                Control::IndirectCall { .. } => {
+                    // 2
+                    // First, query the function to call via LlvmAotMachineEnv
+                    let (query_function, data) = self.emit_env_ffi_function(
+                        machine,
+                        offset_of!(LlvmAotMachineEnv, query_function),
+                    )?;
+                    let mut query_args = [query_function, data, next_pc];
+                    let query_result = self.emit_ffi_call(
+                        machine,
+                        function,
+                        &vars,
+                        &mut query_args,
+                        false,
+                        Some("query_function_result"),
+                    )?;
+                    // There might be 3 cases here:
+                    // * query_result is 0: errors happen at Rust side, this case
+                    // is handled within +emit_ffi_call+
+                    // * query_result is +u64::max_value()+, meaning Rust side failed
+                    // to find a native function. There might still be a case we want
+                    // to handle: loop unrolling generates from a function within current
+                    // function. See +memset+ from +newlib+ for an example here. In
+                    // this case, we first test if +next_pc+ lies within current function,
+                    // if so, we will handle it like an indirect jump.
+                    // * Any other value will be treated like a proper x64 function to
+                    // call.
+                    let normal_call_block = assert_llvm_create!(
+                        LLVMCreateBasicBlockInContext(
+                            self.context,
+                            b"normal_call_block\0".as_ptr() as *const _,
+                        ),
+                        "create normal call block"
+                    );
+                    u!(LLVMAppendExistingBasicBlock(function, normal_call_block));
+                    let interpret_block = assert_llvm_create!(
+                        LLVMCreateBasicBlockInContext(
+                            self.context,
+                            b"interpret_block\0".as_ptr() as *const _,
+                        ),
+                        "create interpret block"
+                    );
+                    u!(LLVMAppendExistingBasicBlock(function, interpret_block));
+                    let failure_block = assert_llvm_create!(
+                        LLVMCreateBasicBlockInContext(
+                            self.context,
+                            b"failure_block\0".as_ptr() as *const _,
+                        ),
+                        "create failure block"
+                    );
+                    u!(LLVMAppendExistingBasicBlock(function, failure_block));
+
+                    let cmp = u!(LLVMBuildICmp(
+                        self.builder,
+                        LLVMIntPredicate::LLVMIntNE,
+                        query_result,
+                        LLVMConstInt(i64t, u64::max_value(), 0),
+                        b"cmp_query_result_to_zero\0".as_ptr() as *const _,
+                    ));
+                    u!(LLVMBuildCondBr(
+                        self.builder,
+                        cmp,
+                        normal_call_block,
+                        interpret_block,
+                    ));
+
+                    u!(LLVMPositionBuilderAtEnd(self.builder, failure_block));
+                    self.emit_call_exit(machine, EXIT_REASON_MALFORMED_INDIRECT_CALL, &vars)?;
+
+                    u!(LLVMPositionBuilderAtEnd(self.builder, normal_call_block));
+                    let query_result_function = u!(LLVMBuildIntToPtr(
+                        self.builder,
+                        query_result,
+                        LLVMPointerType(self.riscv_function_type()?, 0),
+                        b"query_function_result_function\0".as_ptr() as *const _,
+                    ));
+                    // When a proper function is returned(non-zero), use the function
+                    // to build the actual RISC-V call.
+                    self.emit_call_riscv_func_with_func_value(
+                        machine,
+                        &vars,
+                        query_result_function,
+                    )?;
+                    if let Some(resume_address) = block.control.call_resume_address() {
+                        // When returned from the call, update PC using resume address
+                        u!(LLVMBuildStore(
+                            self.builder,
+                            LLVMConstInt(i64t, resume_address, 0),
+                            pc_alloca
+                        ));
+                        if let Some(resume_block) = basic_blocks.get(&resume_address) {
+                            u!(LLVMBuildBr(self.builder, *resume_block));
+                        } else {
+                            self.emit_call_exit(
+                                machine,
+                                EXIT_REASON_UNKNOWN_RESUME_ADDRESS,
+                                &vars,
+                            )?;
+                        }
+                    } else {
+                        return Err(Error::External(format!(
+                            "Invalid resume address: {}",
+                            block.control
+                        )));
+                    }
+
+                    u!(LLVMPositionBuilderAtEnd(self.builder, interpret_block));
+                    // Ensure next_pc is within current function
+                    // TODO: we could also expand this to interpret a whole function
+                    // at a different place.
+                    let cmp_left = u!(LLVMBuildICmp(
+                        self.builder,
+                        LLVMIntPredicate::LLVMIntUGE,
+                        next_pc,
+                        LLVMConstInt(i64t, func.range.start, 0),
+                        b"cmp_next_pc_to_func_start\0".as_ptr() as *const _,
+                    ));
+                    let cmp_right = u!(LLVMBuildICmp(
+                        self.builder,
+                        LLVMIntPredicate::LLVMIntULT,
+                        next_pc,
+                        LLVMConstInt(i64t, func.range.end, 0),
+                        b"cmp_next_pc_to_func_end\0".as_ptr() as *const _,
+                    ));
+
+                    let interpret_block2 = assert_llvm_create!(
+                        LLVMCreateBasicBlockInContext(
+                            self.context,
+                            b"interpret_block2\0".as_ptr() as *const _,
+                        ),
+                        "create interpret block2"
+                    );
+                    u!(LLVMAppendExistingBasicBlock(function, interpret_block2));
+                    let interpret_block3 = assert_llvm_create!(
+                        LLVMCreateBasicBlockInContext(
+                            self.context,
+                            b"interpret_block3\0".as_ptr() as *const _,
+                        ),
+                        "create interpret block3"
+                    );
+                    u!(LLVMAppendExistingBasicBlock(function, interpret_block3));
+
+                    u!(LLVMBuildCondBr(
+                        self.builder,
+                        cmp_left,
+                        interpret_block2,
+                        failure_block
+                    ));
+                    u!(LLVMPositionBuilderAtEnd(self.builder, interpret_block2));
+                    u!(LLVMBuildCondBr(
+                        self.builder,
+                        cmp_right,
+                        interpret_block3,
+                        failure_block
+                    ));
+                    u!(LLVMPositionBuilderAtEnd(self.builder, interpret_block3));
+
+                    // Interpret to the next basic block end
+                    if indirect_dispatch_block.is_none() {
+                        indirect_dispatch_block = Some(self.emit_indirect_dispatch_block(
+                            machine,
+                            function,
+                            &vars,
+                            indirect_dispatch_test_alloca,
+                            &basic_blocks,
+                        )?);
+                    }
+                    let (interpret_function, data) = self
+                        .emit_env_ffi_function(machine, offset_of!(LlvmAotMachineEnv, interpret))?;
+                    let mut interpret_args =
+                        [interpret_function, data, u!(LLVMConstInt(i64t, 0, 0))];
+                    let interpret_result = self.emit_ffi_call(
+                        machine,
+                        function,
+                        &vars,
+                        &mut interpret_args,
+                        true,
+                        Some("interpret_function_result"),
+                    )?;
+                    // Dispatch to the correct basic block
+                    u!(LLVMBuildStore(
+                        self.builder,
+                        interpret_result,
+                        indirect_dispatch_test_alloca,
+                    ));
+                    u!(LLVMBuildBr(self.builder, indirect_dispatch_block.unwrap()));
+
+                    terminated = true;
                 }
                 Control::Tailcall { address, .. } => {
                     // 2
@@ -750,14 +1194,7 @@ impl LlvmCompilingMachine {
                         Error::External(format!("Function at 0x{:x} does not exist!", address))
                     })?);
 
-                    let values = vars.0.map(|value, mapping| {
-                        Ok(u!(LLVMBuildLoad2(
-                            self.builder,
-                            i64t,
-                            value,
-                            cs(&format!("arg_{}", mapping))?.as_ptr()
-                        )))
-                    })?;
+                    let values = vars.load_values()?;
                     let mut invoke_args = values.to_arguments();
                     let result = u!(LLVMBuildCall2(
                         self.builder,
@@ -790,7 +1227,6 @@ impl LlvmCompilingMachine {
                         last_ra_val,
                         b"ra_cmp_last_ra\0".as_ptr() as *const _,
                     ));
-                    let current_block = u!(LLVMGetInsertBlock(self.builder));
 
                     let ret_block = assert_llvm_create!(
                         LLVMCreateBasicBlockInContext(
@@ -815,19 +1251,34 @@ impl LlvmCompilingMachine {
                     self.emit_riscv_return(&vars)?;
 
                     u!(LLVMPositionBuilderAtEnd(self.builder, exit_block));
-                    self.emit_call_exit(machine, EXIT_REASON_UNKNOWN_ADDRESS, &vars)?;
+                    self.emit_call_exit(machine, EXIT_REASON_MALFORMED_RETURN, &vars)?;
 
-                    u!(LLVMPositionBuilderAtEnd(self.builder, current_block));
                     terminated = true;
                 }
                 Control::Ecall { .. } => {
                     // 4
-                    self.emit_call_exit(machine, EXIT_REASON_ECALL, &vars)?;
+                    let (ecall_function, data) =
+                        self.emit_env_ffi_function(machine, offset_of!(LlvmAotMachineEnv, ecall))?;
+                    let mut ecall_args = [ecall_function, data, u!(LLVMConstInt(i64t, 0, 0))];
+                    self.emit_ffi_call(machine, function, &vars, &mut ecall_args, true, None)?;
+                    if let Some(target_block) = basic_blocks.get(&block.range.end) {
+                        u!(LLVMBuildBr(self.builder, *target_block));
+                    } else {
+                        self.emit_call_exit(machine, EXIT_REASON_ECALL_UNREACHABLE, &vars)?;
+                    }
                     terminated = true;
                 }
                 Control::Ebreak { .. } => {
                     // 5
-                    self.emit_call_exit(machine, EXIT_REASON_EBREAK, &vars)?;
+                    let (ebreak_function, data) =
+                        self.emit_env_ffi_function(machine, offset_of!(LlvmAotMachineEnv, ebreak))?;
+                    let mut ebreak_args = [ebreak_function, data, u!(LLVMConstInt(i64t, 0, 0))];
+                    self.emit_ffi_call(machine, function, &vars, &mut ebreak_args, true, None)?;
+                    if let Some(target_block) = basic_blocks.get(&block.range.end) {
+                        u!(LLVMBuildBr(self.builder, *target_block));
+                    } else {
+                        self.emit_call_exit(machine, EXIT_REASON_EBREAK_UNREACHABLE, &vars)?;
+                    }
                     terminated = true;
                 }
             }
@@ -883,16 +1334,26 @@ impl LlvmCompilingMachine {
         Ok(())
     }
 
+    // To the exact contrary of +emit_cleanup+, This function emits code to setup
+    // selected register values from values in LlvmAotCoreMachineData
+    fn emit_setup(&mut self, machine: LLVMValueRef) -> Result<TransientValues, Error> {
+        let i64t = self.i64t()?;
+        TransientValues::new(|mapping| match mapping {
+            Mapping::Pointer => Ok(machine),
+            Mapping::Pc => {
+                let offset = offset_of!(LlvmAotCoreMachineData, pc);
+                self.emit_load_from_machine(machine, offset, i64t, Some("pc"))
+            }
+            Mapping::Register(r) => {
+                let offset = offset_of!(LlvmAotCoreMachineData, registers) + r * 8;
+                self.emit_load_from_machine(machine, offset, i64t, Some(&format!("{}", mapping)))
+            }
+        })
+    }
+
     // Emit return statement for a RISC-V function
     fn emit_riscv_return(&mut self, allocas: &RegAllocas) -> Result<(), Error> {
-        let ret_value = allocas.0.map(|value, mapping| {
-            Ok(u!(LLVMBuildLoad2(
-                self.builder,
-                self.i64t()?,
-                value,
-                cs(&format!("ret_{}", mapping))?.as_ptr()
-            )))
-        })?;
+        let ret_value = allocas.load_values()?;
 
         let mut ret_args = ret_value.to_return_values();
         u!(LLVMBuildAggregateRet(
@@ -1999,6 +2460,15 @@ impl LlvmCompilingMachine {
             ))
         })?);
 
+        self.emit_call_riscv_func_with_func_value(machine, allocas, func_llvm_value)
+    }
+
+    fn emit_call_riscv_func_with_func_value(
+        &mut self,
+        machine: LLVMValueRef,
+        allocas: &RegAllocas,
+        func_llvm_value: LLVMValueRef,
+    ) -> Result<(), Error> {
         let i64t = self.i64t()?;
         let riscv_function_type = self.riscv_function_type()?;
 
@@ -2019,14 +2489,7 @@ impl LlvmCompilingMachine {
             Some("last_ra"),
         )?;
 
-        let values = allocas.0.map(|value, mapping| {
-            Ok(u!(LLVMBuildLoad2(
-                self.builder,
-                i64t,
-                value,
-                cs(&format!("arg_{}", mapping))?.as_ptr()
-            )))
-        })?;
+        let values = allocas.load_values()?;
         let mut invoke_args = values.to_arguments();
         let result = u!(LLVMBuildCall2(
             self.builder,
@@ -2059,9 +2522,7 @@ impl LlvmCompilingMachine {
             ));
         }
         let ret_values = TransientValues::from_return_values(ret_values, machine);
-        for (i, (value, _)) in ret_values.iter().enumerate() {
-            u!(LLVMBuildStore(self.builder, value, allocas.0 .0[i],));
-        }
+        allocas.store_values(&ret_values)?;
         Ok(())
     }
 
@@ -2072,14 +2533,7 @@ impl LlvmCompilingMachine {
         reason: u8,
         allocas: &RegAllocas,
     ) -> Result<(), Error> {
-        let values = allocas.0.map(|value, mapping| {
-            Ok(u!(LLVMBuildLoad2(
-                self.builder,
-                self.i64t()?,
-                value,
-                cs(&format!("arg_{}", mapping))?.as_ptr()
-            )))
-        })?;
+        let values = allocas.load_values()?;
 
         let i8t = self.i8t()?;
         self.emit_store_to_machine(
@@ -2119,12 +2573,7 @@ impl LlvmCompilingMachine {
         }
         let i64t = self.i64t()?;
         if let Some(i) = REVERSE_MAPPINGS.get(&reg) {
-            Ok(u!(LLVMBuildLoad2(
-                self.builder,
-                i64t,
-                allocas.0 .0[*i],
-                cs(&format!("{}", name.unwrap_or("uNKNOWn")))?.as_ptr()
-            )))
+            allocas.load_value(*i)
         } else {
             self.emit_load_from_machine(
                 machine,
@@ -2147,8 +2596,7 @@ impl LlvmCompilingMachine {
             return Ok(());
         }
         if let Some(i) = REVERSE_MAPPINGS.get(&reg) {
-            u!(LLVMBuildStore(self.builder, value, allocas.0 .0[*i]));
-            Ok(())
+            allocas.store_value(*i, value)
         } else {
             let i64t = self.i64t()?;
             self.emit_store_to_machine(
@@ -2219,7 +2667,7 @@ impl LlvmCompilingMachine {
         name: Option<&str>,
     ) -> Result<LLVMValueRef, Error> {
         let i64t = self.i64t()?;
-        self.emit_load_with_value_offset_from_machine(
+        self.emit_load_from_struct(
             machine,
             u!(LLVMConstInt(i64t, offset as u64, 0)),
             value_type,
@@ -2227,9 +2675,8 @@ impl LlvmCompilingMachine {
         )
     }
 
-    // Similar to emit_load_from_machine, but accepts offset as an LLVM value,
-    // which could include runtime computable values.
-    fn emit_load_with_value_offset_from_machine(
+    // Load values at any offset from a struct.
+    fn emit_load_from_struct(
         &mut self,
         machine: LLVMValueRef,
         offset: LLVMValueRef,
@@ -2259,6 +2706,233 @@ impl LlvmCompilingMachine {
             cs(&format!("{}_loaded_value", name))?.as_ptr(),
         ));
         Ok(value)
+    }
+
+    // Emit code used to locate FFI function together with the data object.
+    fn emit_env_ffi_function(
+        &mut self,
+        machine: LLVMValueRef,
+        offset: usize,
+    ) -> Result<(LLVMValueRef, LLVMValueRef), Error> {
+        let i64t = self.i64t()?;
+        let env = self.emit_load_from_machine(
+            machine,
+            offset_of!(LlvmAotCoreMachineData, env),
+            i64t,
+            Some("env"),
+        )?;
+        let data = self.emit_load_from_struct(
+            env,
+            u!(LLVMConstInt(
+                i64t,
+                offset_of!(LlvmAotMachineEnv, data) as u64,
+                0
+            )),
+            i64t,
+            Some("env_data"),
+        )?;
+        let ffi_function_value = self.emit_load_from_struct(
+            env,
+            u!(LLVMConstInt(i64t, offset as u64, 0)),
+            i64t,
+            Some("env_ffi_function_value"),
+        )?;
+        let ffi_function = u!(LLVMBuildIntToPtr(
+            self.builder,
+            ffi_function_value,
+            LLVMPointerType(self.ffi_function_type()?, 0),
+            b"env_ffi_function\0".as_ptr() as *const _,
+        ));
+        Ok((ffi_function, data))
+    }
+
+    // In case a function contains indirect dispatches, we will emit a special
+    // basic block used to locate the correct basic block after the indirect
+    // dispatch.
+    fn emit_indirect_dispatch_block(
+        &mut self,
+        machine: LLVMValueRef,
+        function: LLVMValueRef,
+        allocas: &RegAllocas,
+        test_value_alloca: LLVMValueRef,
+        basic_blocks: &HashMap<u64, LLVMBasicBlockRef>,
+    ) -> Result<LLVMBasicBlockRef, Error> {
+        let current_block = u!(LLVMGetInsertBlock(self.builder));
+
+        let dispatch_block = assert_llvm_create!(
+            LLVMCreateBasicBlockInContext(
+                self.context,
+                b"indirect_dispatch_block\0".as_ptr() as *const _,
+            ),
+            "create dispatch block"
+        );
+        u!(LLVMAppendExistingBasicBlock(function, dispatch_block));
+        u!(LLVMPositionBuilderAtEnd(self.builder, dispatch_block));
+
+        let test_value = u!(LLVMBuildLoad2(
+            self.builder,
+            self.i64t()?,
+            test_value_alloca,
+            b"indirect_dispatch_test_value\0".as_ptr() as *const _,
+        ));
+
+        let failure_block = assert_llvm_create!(
+            LLVMCreateBasicBlockInContext(
+                self.context,
+                b"indirect_jump_failure_block\0".as_ptr() as *const _,
+            ),
+            "create failure block"
+        );
+        u!(LLVMAppendExistingBasicBlock(function, failure_block));
+
+        let mut indirect_jump_targets: Vec<(u64, LLVMBasicBlockRef)> =
+            basic_blocks.iter().map(|(a, b)| (*a, *b)).collect();
+        indirect_jump_targets.sort_by_key(|(a, _)| *a);
+        self.emit_select_control(
+            function,
+            dispatch_block,
+            test_value,
+            &indirect_jump_targets,
+            failure_block,
+        )?;
+
+        u!(LLVMPositionBuilderAtEnd(self.builder, failure_block));
+        self.emit_call_exit(machine, EXIT_REASON_UNKNOWN_PC_VALUE, &allocas)?;
+
+        u!(LLVMPositionBuilderAtEnd(self.builder, current_block));
+
+        Ok(dispatch_block)
+    }
+
+    // Emit a binary search pattern picking target to branch to. Jump
+    // to failure_block if no matching value is found.
+    fn emit_select_control(
+        &mut self,
+        function: LLVMValueRef,
+        current_block: LLVMBasicBlockRef,
+        test_value: LLVMValueRef,
+        targets: &[(u64, LLVMBasicBlockRef)],
+        failure_block: LLVMBasicBlockRef,
+    ) -> Result<(), Error> {
+        u!(LLVMPositionBuilderAtEnd(self.builder, current_block));
+        if targets.is_empty() {
+            u!(LLVMBuildBr(self.builder, failure_block));
+            return Ok(());
+        }
+
+        let mid = targets.len() / 2;
+        let mid_value = u!(LLVMConstInt(self.i64t()?, targets[mid].0, 0));
+        // First test for equality
+        let ne_block = self.emit_match_or_new_block(
+            function,
+            LLVMIntPredicate::LLVMIntEQ,
+            test_value,
+            mid_value,
+            targets[mid].1,
+        )?;
+
+        u!(LLVMPositionBuilderAtEnd(self.builder, ne_block));
+        let right_block = if mid > 0 {
+            // Test for left branch
+            let left_block = assert_llvm_create!(
+                LLVMCreateBasicBlockInContext(
+                    self.context,
+                    b"select_control_left_block\0".as_ptr() as *const _,
+                ),
+                "create left block"
+            );
+            u!(LLVMAppendExistingBasicBlock(function, left_block));
+            self.emit_select_control(
+                function,
+                left_block,
+                test_value,
+                &targets[0..mid],
+                failure_block,
+            )?;
+
+            u!(LLVMPositionBuilderAtEnd(self.builder, ne_block));
+            self.emit_match_or_new_block(
+                function,
+                LLVMIntPredicate::LLVMIntULT,
+                test_value,
+                mid_value,
+                left_block,
+            )?
+        } else {
+            // Left branch is empty, switch to right branch directly
+            ne_block
+        };
+
+        u!(LLVMPositionBuilderAtEnd(self.builder, right_block));
+        if mid < targets.len() - 1 {
+            // Test for right branch
+            self.emit_select_control(
+                function,
+                right_block,
+                test_value,
+                &targets[(mid + 1)..targets.len()],
+                failure_block,
+            )?;
+        } else {
+            // Right branch is empty, matching results in a failure
+            u!(LLVMBuildBr(self.builder, failure_block));
+        }
+
+        Ok(())
+    }
+
+    // Given a set of icmp inputs, perform the actual cmp operation, if
+    // true, branch to +true_block+, otherwise create a new block to jump
+    // to.
+    fn emit_match_or_new_block(
+        &mut self,
+        function: LLVMValueRef,
+        predicate: LLVMIntPredicate,
+        lhs: LLVMValueRef,
+        rhs: LLVMValueRef,
+        true_block: LLVMBasicBlockRef,
+    ) -> Result<LLVMBasicBlockRef, Error> {
+        let else_block = assert_llvm_create!(
+            LLVMCreateBasicBlockInContext(
+                self.context,
+                b"select_control_else_block\0".as_ptr() as *const _,
+            ),
+            "create else block"
+        );
+        u!(LLVMAppendExistingBasicBlock(function, else_block));
+
+        let cmp = u!(LLVMBuildICmp(
+            self.builder,
+            predicate,
+            lhs,
+            rhs,
+            b"select_control_cmp\0".as_ptr() as *const _,
+        ));
+        u!(LLVMBuildCondBr(self.builder, cmp, true_block, else_block));
+
+        Ok(else_block)
+    }
+
+    fn ffi_wrapper_function_type(&mut self) -> Result<LLVMTypeRef, Error> {
+        let i64t = self.i64t()?;
+        let mut argts = [
+            u!(LLVMPointerType(self.ffi_function_type()?, 0)),
+            i64t,
+            i64t,
+        ];
+        Ok(assert_llvm_create!(
+            LLVMFunctionType(i64t, argts.as_mut_ptr(), argts.len() as u32, 0),
+            "ffi function type"
+        ))
+    }
+
+    fn ffi_function_type(&mut self) -> Result<LLVMTypeRef, Error> {
+        let i64t = self.i64t()?;
+        let mut argts = [i64t, i64t];
+        Ok(assert_llvm_create!(
+            LLVMFunctionType(i64t, argts.as_mut_ptr(), argts.len() as u32, 0),
+            "ffi function type"
+        ))
     }
 
     fn riscv_function_type(&mut self) -> Result<LLVMTypeRef, Error> {
@@ -2364,8 +3038,8 @@ impl LlvmCompilingMachine {
     mov %rbp, (%rdi)
     mov (%rsp), %rcx   # (%rsp) contains the return address
     mov %rcx, 8(%rdi)
-    mov %rbx, (%rsp)   # short for `add $8, %rsp; push %rbx`
-    push %r12
+    mov %rbx, 24(%rdi)
+    mov %r12, (%rsp)   # short for `add $8, %rsp; push %r12`
     push %r13
     push %r14
     push %r15
@@ -2375,11 +3049,11 @@ impl LlvmCompilingMachine {
 {}:
     mov (%rdi), %rbp
     mov 16(%rdi), %rsp
+    mov 24(%rdi), %rbx
     pop %r15
     pop %r14
     pop %r13
     pop %r12
-    pop %rbx
     mov $1, %eax
     jmp *8(%rdi)
         "#,
@@ -2510,7 +3184,57 @@ impl TransientValues {
     }
 }
 
-pub struct RegAllocas(TransientValues);
+pub struct RegAllocas {
+    values: TransientValues,
+    builder: LLVMBuilderRef,
+    i64t: LLVMTypeRef,
+}
+
+impl RegAllocas {
+    pub fn new(values: TransientValues, builder: LLVMBuilderRef, i64t: LLVMTypeRef) -> Self {
+        Self {
+            values,
+            builder,
+            i64t,
+        }
+    }
+
+    pub fn pc_alloca(&self) -> Result<LLVMValueRef, Error> {
+        self.values.extract_pc()
+    }
+
+    pub fn load_value(&self, idx: usize) -> Result<LLVMValueRef, Error> {
+        Ok(u!(LLVMBuildLoad2(
+            self.builder,
+            self.i64t,
+            self.values.0[idx],
+            cs(&format!("reg_allocas_idx_{}", idx))?.as_ptr()
+        )))
+    }
+
+    pub fn store_value(&self, idx: usize, value: LLVMValueRef) -> Result<(), Error> {
+        u!(LLVMBuildStore(self.builder, value, self.values.0[idx],));
+        Ok(())
+    }
+
+    pub fn load_values(&self) -> Result<TransientValues, Error> {
+        self.values.map(|value, mapping| {
+            Ok(u!(LLVMBuildLoad2(
+                self.builder,
+                self.i64t,
+                value,
+                cs(&format!("reg_allocas_tmp_{}", mapping))?.as_ptr()
+            )))
+        })
+    }
+
+    pub fn store_values(&self, values: &TransientValues) -> Result<(), Error> {
+        for (i, (value, _)) in values.iter().enumerate() {
+            u!(LLVMBuildStore(self.builder, value, self.values.0[i]));
+        }
+        Ok(())
+    }
+}
 
 fn return_values_to_arguments(
     values: [LLVMValueRef; 14],

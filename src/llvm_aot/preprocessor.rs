@@ -465,6 +465,11 @@ fn parse_basic_block<M: Memory>(
                     address: callee,
                     writes: last_writes,
                 }
+            } else if end_with_possible_indirect_call(block_end, &last_pc, &last_writes) {
+                Control::IndirectCall {
+                    pc: last_pc,
+                    writes: last_writes,
+                }
             } else if let Some(callee) = end_with_tail_call(&last_pc, &last_writes, func_addresses)
             {
                 Control::Tailcall { address: callee }
@@ -522,6 +527,19 @@ fn end_with_call(
         }
     }
     None
+}
+
+fn end_with_possible_indirect_call(block_end: u64, last_pc: &Value, last_writes: &[Write]) -> bool {
+    if let Some(last_write) = last_writes.last() {
+        if last_write.is_simple_register_write(RA, block_end) {
+            if let Value::Op2(ActionOp2::Bitand, _v1, v2) = last_pc {
+                if let Value::Imm(0xfffffffffffffffe) = &**v2 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn end_with_tail_call(

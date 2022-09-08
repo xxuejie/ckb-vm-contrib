@@ -28,6 +28,10 @@ struct Args {
     #[clap(long, default_value = "true")]
     optimize: bool,
 
+    /// Running in fast mode
+    #[clap(short, long)]
+    fast: bool,
+
     /// CKB-VM memory size to use when running the program
     #[clap(short, long, default_value = "4194304")]
     memory_size: usize,
@@ -111,7 +115,7 @@ fn main() -> Result<(), Error> {
                 .collect();
             let t0 = SystemTime::now();
             machine.load_program(&code, &run_args)?;
-            let exit = machine.run();
+            let exit = machine.run(args.fast);
             if args.time {
                 let t1 = SystemTime::now();
                 let duration = t1.duration_since(t0).expect("time went backwards");

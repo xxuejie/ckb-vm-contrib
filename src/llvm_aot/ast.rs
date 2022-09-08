@@ -63,6 +63,7 @@ impl fmt::Display for Write {
 pub enum Control {
     Jump { pc: Value, writes: Vec<Write> },
     Call { address: u64, writes: Vec<Write> },
+    IndirectCall { pc: Value, writes: Vec<Write> },
     Tailcall { address: u64 },
     Return { pc: Value, writes: Vec<Write> },
     Ecall { pc: Value },
@@ -74,6 +75,7 @@ impl Control {
         match self {
             Control::Jump { pc, .. } => pc.clone(),
             Control::Call { address, .. } => Value::Imm(*address),
+            Control::IndirectCall { pc, .. } => pc.clone(),
             Control::Tailcall { address } => Value::Imm(*address),
             Control::Return { pc, .. } => pc.clone(),
             Control::Ecall { pc } => pc.clone(),
@@ -85,6 +87,7 @@ impl Control {
         match self {
             Control::Jump { writes, .. } => Some(writes),
             Control::Call { writes, .. } => Some(writes),
+            Control::IndirectCall { writes, .. } => Some(writes),
             Control::Return { writes, .. } => Some(writes),
             Control::Tailcall { .. } => None,
             Control::Ecall { .. } => None,
@@ -95,8 +98,13 @@ impl Control {
     // For calls, there should be a Write setting RA to a specific value,
     // this method checks Control structure and return such a value if exists.
     pub fn call_resume_address(&self) -> Option<u64> {
-        if let Control::Call { writes, .. } = self {
-            return writes.iter().find_map(|write| {
+        let writes = match self {
+            Control::Call { writes, .. } => Some(writes),
+            Control::IndirectCall { writes, .. } => Some(writes),
+            _ => None,
+        };
+        writes.and_then(|writes| {
+            writes.iter().find_map(|write| {
                 if let Write::Register { index, value } = write {
                     if *index == RA {
                         if let Value::Imm(imm) = value {
@@ -105,9 +113,8 @@ impl Control {
                     }
                 }
                 None
-            });
-        }
-        None
+            })
+        })
     }
 }
 
@@ -125,6 +132,9 @@ impl fmt::Display for Control {
         match self {
             Control::Jump { pc, .. } => write!(f, "Jump to {}{}", PrettyValue::new(pc), suffix),
             Control::Call { address, .. } => write!(f, "Call to 0x{:x}{}", address, suffix),
+            Control::IndirectCall { pc, .. } => {
+                write!(f, "Indirect call to {}{}", PrettyValue::new(pc), suffix)
+            }
             Control::Tailcall { address, .. } => write!(f, "Tailcall to 0x{:x}{}", address, suffix),
             Control::Return { .. } => write!(f, "Return{}", suffix),
             Control::Ecall { .. } => write!(f, "Ecall{}", suffix),
