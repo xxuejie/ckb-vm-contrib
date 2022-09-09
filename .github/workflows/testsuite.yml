@@ -21,6 +21,6 @@ jobs:
     - name: Install llvm 14
       run: wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 14 all
     - name: Clone test suite
-      run: git clone https://github.com/xxuejie/ckb-vm-contrib-test-suite && cd ckb-vm-contrib-test-suite && git checkout f4749e68168a56f0470b4d0014e4b22890351c49 && git submodule update --init --recursive
+      run: git clone https://github.com/xxuejie/ckb-vm-contrib-test-suite && cd ckb-vm-contrib-test-suite && git checkout 8138f9950cbac46a95647c1929b3af1acbedd559 && git submodule update --init --recursive
     - name: Run test suite
       run: cd ckb-vm-contrib-test-suite && ln -s .. ckb-vm-contrib && RISCV=`pwd`/../riscv ./test.sh
