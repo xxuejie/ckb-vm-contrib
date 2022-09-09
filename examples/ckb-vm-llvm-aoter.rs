@@ -1,9 +1,14 @@
 use ckb_vm::{machine::DefaultMachineBuilder, Bytes, Error};
 use ckb_vm_contrib::{
-    llvm_aot::{DlSymbols, LlvmAotCoreMachine, LlvmAotMachine, LlvmCompilingMachine},
+    llvm_aot::{
+        ast::Control, preprocess, DlSymbols, Func, LlvmAotCoreMachine, LlvmAotMachine,
+        LlvmCompilingMachine,
+    },
     syscalls::{DebugSyscall, TimeSyscall},
 };
 use clap::{Parser, ValueEnum};
+use std::fs::File;
+use std::io::{self, Write};
 use std::process::Command;
 use std::time::SystemTime;
 use tempfile::Builder;
@@ -11,6 +16,7 @@ use tempfile::Builder;
 #[derive(ValueEnum, Clone, Debug)]
 enum Generate {
     Hash,
+    Writes,
     Bitcode,
     Object,
     SharedLibrary,
@@ -45,8 +51,8 @@ struct Args {
     symbol_prefix: String,
 
     /// Output file path
-    #[clap(short, long, default_value = "compiled.o")]
-    output: String,
+    #[clap(short, long)]
+    output: Option<String>,
 
     /// Input file path
     #[clap(short, long, required = true)]
@@ -72,6 +78,15 @@ fn main() -> Result<(), Error> {
             let code_hash: [u8; 32] = blake3::hash(&code).into();
             println!("{:x}", Bytes::from(code_hash.to_vec()));
         }
+        Generate::Writes => {
+            let output: Box<dyn Write> = match args.output {
+                None => Box::new(io::stdout()),
+                Some(s) if s == "-" => Box::new(io::stdout()),
+                Some(o) => Box::new(File::create(&o)?),
+            };
+            let funcs = preprocess(&code)?;
+            dump_funcs(output, &funcs)?;
+        }
         Generate::Bitcode => {
             let t0 = SystemTime::now();
             let machine = LlvmCompilingMachine::load(&args.input, &code, &args.symbol_prefix)?;
@@ -81,16 +96,19 @@ fn main() -> Result<(), Error> {
                 let duration = t1.duration_since(t0).expect("time went backwards");
                 println!("Time to emit LLVM bitcode: {:?}", duration);
             }
-            std::fs::write(&args.output, &bitcode)?;
+            let output = args.output.unwrap_or("a.bc".to_string());
+            std::fs::write(&output, &bitcode)?;
         }
         Generate::Object => {
-            build_object(&code, &args, &args.output)?;
+            let output = args.output.clone().unwrap_or("a.o".to_string());
+            build_object(&code, &args, &output)?;
         }
         Generate::SharedLibrary => {
             let object_file = Builder::new().suffix(".o").tempfile()?;
             let object_path = object_file.path().to_str().expect("tempfile");
             build_object(&code, &args, object_path)?;
-            build_shared_library(object_path, &args.output)?;
+            let output = args.output.unwrap_or("a.so".to_string());
+            build_shared_library(object_path, &output)?;
         }
         Generate::RunResult => {
             let object_file = Builder::new().suffix(".o").tempfile()?;
@@ -121,11 +139,18 @@ fn main() -> Result<(), Error> {
                 let duration = t1.duration_since(t0).expect("time went backwards");
                 println!("Time to run program: {:?}", duration);
             }
-            let exit_code = exit?;
-            if exit_code != 0 {
-                println!("Non-zero exit code: {}\n{}", exit_code, machine.machine);
-            }
-            std::process::exit(exit_code as i32);
+            match &exit {
+                Err(e) => {
+                    println!("Run error encountered: {:?}", e);
+                    println!("Machine: {}", machine.machine);
+                }
+                Ok(0) => (),
+                Ok(i) => {
+                    println!("Non-zero exit code: {}", i);
+                    println!("Machine: {}", machine.machine);
+                }
+            };
+            std::process::exit(exit.unwrap_or(-1) as i32);
         }
     }
 
@@ -160,5 +185,63 @@ fn build_shared_library(input: &str, output: &str) -> Result<(), Error> {
         )));
     }
 
+    Ok(())
+}
+
+fn dump_funcs(mut o: Box<dyn Write>, funcs: &[Func]) -> Result<(), Error> {
+    for func in funcs {
+        write!(
+            o,
+            "Func: {} at 0x{:x}-0x{:x}\n",
+            func.force_name(true),
+            func.range.start,
+            func.range.end
+        )?;
+
+        for block in &func.basic_blocks {
+            write!(
+                o,
+                "  Basic block (insts: {}) 0x{:x}-0x{:x}:\n",
+                block.insts, block.range.start, block.range.end,
+            )?;
+            write!(
+                o,
+                "  Possible targets after block: {}\n",
+                block
+                    .possible_targets()
+                    .iter()
+                    .map(|a| format!("0x{:x}", a))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )?;
+            for (i, batch) in block.write_batches.iter().enumerate() {
+                write!(o, "    Write batch {}\n", i)?;
+                for write in batch {
+                    write!(o, "      {}\n", write)?;
+                }
+            }
+            dump_control(&mut o, &block.control, &funcs)?;
+            if let Some(last_writes) = block.control.writes() {
+                for write in last_writes {
+                    write!(o, "      {}\n", write)?;
+                }
+            }
+            write!(o, "\n")?;
+        }
+    }
+    Ok(())
+}
+
+fn dump_control(o: &mut Box<dyn Write>, control: &Control, funcs: &[Func]) -> Result<(), Error> {
+    match control {
+        Control::Call { address, .. } => {
+            if let Some(func) = funcs.iter().find(|f| f.range.start == *address) {
+                write!(o, "    {} ({})", control, func.force_name(true))?;
+                return Ok(());
+            }
+        }
+        _ => (),
+    };
+    write!(o, "    {}\n", control)?;
     Ok(())
 }
