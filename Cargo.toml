@@ -1,7 +1,7 @@
 [package]
 name = "ckb-vm-contrib"
 description = "Collection of decoupled code for ckb-vm"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 authors = ["Xuejie Xiao <xxuejie@gmail.com>"]
 edition = "2021"
@@ -20,8 +20,8 @@ llvm-aot = [
 ]
 
 [dependencies]
-ckb-vm = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "f77f3d1" }
-ckb-vm-definitions = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "f77f3d1" }
+ckb-vm = "0.21.6"
+ckb-vm-definitions = "0.21.6"
 goblin = "=0.4.0"
 lazy_static = "1.4.0"
 log = "0.4.17"
