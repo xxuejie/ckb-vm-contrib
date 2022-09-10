@@ -49,15 +49,13 @@ impl AuxDecoder {
                 if let Ok(Some(i)) = rule_auipc() {
                     return Ok(i);
                 } else {
-                    // Note OP_CUSTOM_LOAD_IMM uses 32-bit sign extension, which is
-                    // different from the semantics of AUIPC.
-                    // let value = pc.wrapping_add(i64::from(i.immediate_s()) as u64);
-                    // if let Ok(value) = value.try_into() {
-                    // return Ok(set_instruction_length_n(
-                    // Utype::new(insts::OP_CUSTOM_LOAD_IMM, i.rd(), value).0,
-                    // head_len,
-                    // ));
-                    // }
+                    let value = pc.wrapping_add(i64::from(i.immediate_s()) as u64);
+                    if let Ok(value) = value.try_into() {
+                        return Ok(set_instruction_length_n(
+                            Utype::new(insts::OP_CUSTOM_LOAD_UIMM, i.rd(), value).0,
+                            head_len,
+                        ));
+                    }
                 }
             }
             _ => (),
