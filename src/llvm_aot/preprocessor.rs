@@ -1,4 +1,5 @@
 use super::{
+    super::printer::InstructionPrinter,
     ast::{simplify_with_writes, AstMachine, Control, Write},
     AOT_ISA, AOT_VERSION,
 };
@@ -26,6 +27,8 @@ pub struct BasicBlock {
     pub control: Control,
     pub insts: usize,
     pub cycles: u64,
+
+    pub debug_lines: Vec<String>,
 }
 
 impl BasicBlock {
@@ -400,12 +403,18 @@ fn parse_basic_block<M: Memory>(
     instruction_cycle_func: &InstructionCycleFunc,
 ) -> Result<(Option<BasicBlock>, u64), Error> {
     let mut insts = vec![];
+    let mut debug_lines = vec![];
     let mut invalid = false;
     let mut pc = block_start;
     while pc < block_maximum_end {
         match decoder.decode(memory, pc) {
             Ok(instruction) => {
                 insts.push(instruction);
+                debug_lines.push(format!(
+                    "0x{:x}: {}",
+                    pc,
+                    InstructionPrinter::new(instruction.try_into()?)
+                ));
                 pc += instruction_length(instruction) as u64;
                 if is_basic_block_end_instruction(instruction) {
                     break;
@@ -530,6 +539,7 @@ fn parse_basic_block<M: Memory>(
         control,
         insts: len,
         cycles,
+        debug_lines,
     };
 
     Ok((Some(block), pc))

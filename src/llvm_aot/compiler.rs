@@ -22,6 +22,7 @@ use llvm_sys::{
     analysis::*,
     bit_writer::*,
     core::*,
+    debuginfo::*,
     prelude::*,
     target::*,
     target_machine::*,
@@ -32,7 +33,8 @@ use memoffset::offset_of;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
-use std::mem;
+use std::fs::File;
+use std::io::Write as StdWrite;
 use std::path::Path;
 use std::ptr;
 
@@ -42,12 +44,19 @@ pub struct LlvmCompilingMachine {
     module: LLVMModuleRef,
     pass: LLVMPassManagerRef,
 
+    di_builder: LLVMDIBuilderRef,
+    compile_file: LLVMMetadataRef,
+    compile_unit: LLVMMetadataRef,
+    debug_file_writer: Option<DebugFileWriter>,
+
     funcs: Vec<Func>,
     code_hash: [u8; 32],
     symbol_prefix: String,
 
     // RISC-V function address -> generated LLVM function reference
     emitted_funcs: HashMap<u64, LLVMValueRef>,
+    // Entry function to AOT code
+    entry_func: LLVMValueRef,
     // RISC-V early exit function
     exit_func: LLVMValueRef,
     // Wrapper to call into Rust FFI functions
@@ -88,11 +97,17 @@ impl LlvmCompilingMachine {
         code: &Bytes,
         symbol_prefix: &str,
         instruction_cycle_func: &InstructionCycleFunc,
+        generate_debug_info: bool,
     ) -> Result<Self, Error> {
         let name = Path::new(name)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(name);
+        let directory = Path::new(name)
+            .parent()
+            .and_then(|s| s.to_str())
+            .unwrap_or(".");
+
         let funcs = preprocess(code, instruction_cycle_func)?;
         let context = assert_llvm_create!(LLVMContextCreate(), "context");
         let module = assert_llvm_create!(
@@ -103,6 +118,59 @@ impl LlvmCompilingMachine {
             "module"
         );
         let builder = assert_llvm_create!(LLVMCreateBuilderInContext(context), "builder");
+
+        let (di_builder, compile_file, compile_unit, debug_file_writer) = if generate_debug_info {
+            let debug_file_name = format!("{}.debug.s", name);
+            let di_builder = assert_llvm_create!(LLVMCreateDIBuilder(module), "di builder");
+            let compile_file = u!(LLVMDIBuilderCreateFile(
+                di_builder,
+                debug_file_name.as_ptr() as *const _,
+                debug_file_name.len(),
+                directory.as_ptr() as *const _,
+                directory.len(),
+            ));
+            let producer = "ckb-vm-llvm-aot-engine";
+            let compile_unit = assert_llvm_create!(
+                LLVMDIBuilderCreateCompileUnit(
+                    di_builder,
+                    LLVMDWARFSourceLanguage::LLVMDWARFSourceLanguageC,
+                    compile_file,
+                    producer.as_ptr() as *const _,
+                    producer.len(),
+                    0,                         // isOptimized
+                    "\0".as_ptr() as *const _, // Flags
+                    0,
+                    0,                         // RuntimeVer
+                    "\0".as_ptr() as *const _, // SplitName
+                    0,
+                    LLVMDWARFEmissionKind::LLVMDWARFEmissionKindFull,
+                    0,                         // DWOId
+                    1,                         // SplitDebugInlining
+                    0,                         // DebugInfoForProfiling
+                    "\0".as_ptr() as *const _, // SysRoot
+                    0,
+                    "\0".as_ptr() as *const _, // SDK
+                    0
+                ),
+                "compile unit"
+            );
+            let debug_file_writer = DebugFileWriter::new(
+                context,
+                compile_unit,
+                Path::new(directory)
+                    .join(debug_file_name)
+                    .to_str()
+                    .ok_or(Error::External("invalid file name!".to_string()))?,
+            )?;
+            (
+                di_builder,
+                compile_file,
+                compile_unit,
+                Some(debug_file_writer),
+            )
+        } else {
+            (ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), None)
+        };
 
         let pass = assert_llvm_create!(LLVMCreatePassManager(), "create pass manager");
         unsafe {
@@ -124,11 +192,16 @@ impl LlvmCompilingMachine {
             builder,
             module,
             pass,
+            di_builder,
+            compile_file,
+            compile_unit,
+            debug_file_writer,
             funcs,
             emitted_funcs,
             code_hash,
             symbol_prefix: symbol_prefix.to_string(),
-            // This will be updated in emit function
+            // Those will be updated in emit function
+            entry_func: ptr::null_mut(),
             exit_func: ptr::null_mut(),
             ffi_wrapper_func: ptr::null_mut(),
         })
@@ -206,11 +279,12 @@ impl LlvmCompilingMachine {
         address_table_values.push(u!(LLVMConstInt(i64t, self.funcs.len() as u64, 0)));
         for func in self.funcs.clone() {
             // Build signature for each function here, so we can piece together calls later
-            let function_name = cs(&format!("{}{}", self.symbol_prefix, func.force_name(false)))?;
+            let function_name = format!("{}{}", self.symbol_prefix, func.force_name(false));
+            let function_name_cstr = cs(&function_name)?;
             let function = assert_llvm_create!(
                 LLVMAddFunction(
                     self.module,
-                    function_name.as_ptr(),
+                    function_name_cstr.as_ptr(),
                     self.riscv_function_type()?
                 ),
                 "create function"
@@ -265,6 +339,24 @@ impl LlvmCompilingMachine {
         );
         u!(LLVMSetInitializer(code_hash_var, code_hash));
 
+        self.entry_func = {
+            let entry_function_type = {
+                // *mut LlvmAotCoreMachineData, pointer for the host function to execute
+                let mut args_type = [i64t, i64t];
+                assert_llvm_create!(
+                    LLVMFunctionType(i8t, args_type.as_mut_ptr(), args_type.len() as u32, 0),
+                    "entry function type"
+                )
+            };
+            assert_llvm_create!(
+                LLVMAddFunction(
+                    self.module,
+                    cs(&format!("{}____entry____", self.symbol_prefix))?.as_ptr(),
+                    entry_function_type
+                ),
+                "create entry function"
+            )
+        };
         self.exit_func = assert_llvm_create!(
             LLVMAddFunction(
                 self.module,
@@ -306,7 +398,7 @@ impl LlvmCompilingMachine {
         ));
 
         // Build the actual function bodies
-        for func in mem::replace(&mut self.funcs, Vec::new()) {
+        for func in self.funcs.clone() {
             self.emit_riscv_func(&func)?;
         }
 
@@ -314,8 +406,52 @@ impl LlvmCompilingMachine {
         self.emit_exit()?;
         self.emit_ffi_wrapper()?;
 
+        // Finalize all dependencies
+        if !self.di_builder.is_null() {
+            u!(LLVMDIBuilderFinalize(self.di_builder));
+        }
+
         if optimize {
             u!(LLVMRunPassManager(self.pass, self.module));
+        }
+
+        // Verify all functions
+        // TODO: Ideally we should use LLVMPrintMessageAction and return an error at
+        // Rust side, but in reality LLVM and Rust will be competing for STDOUT when
+        // printing errors. Using LLVMAbortProcessAction here at least enables us to
+        // see the full generated error message at LLVM side. Later we shall revisit
+        // this to see how we can tackle the problem.
+        assert_llvm_call!(
+            LLVMVerifyFunction(
+                self.entry_func,
+                LLVMVerifierFailureAction::LLVMAbortProcessAction
+            ),
+            "verifying entry function".to_string()
+        );
+        assert_llvm_call!(
+            LLVMVerifyFunction(
+                self.exit_func,
+                LLVMVerifierFailureAction::LLVMAbortProcessAction
+            ),
+            "verifying exit function".to_string()
+        );
+        assert_llvm_call!(
+            LLVMVerifyFunction(
+                self.ffi_wrapper_func,
+                LLVMVerifierFailureAction::LLVMAbortProcessAction
+            ),
+            "verifying ffi wrapper function".to_string()
+        );
+        for func in &self.funcs {
+            let function = self.emitted_funcs[&func.range.start];
+            assert_llvm_call!(
+                LLVMVerifyFunction(function, LLVMVerifierFailureAction::LLVMAbortProcessAction),
+                &format!(
+                    "verifying function {} at 0x{:x}",
+                    func.force_name(true),
+                    func.range.start
+                )
+            );
         }
 
         Ok(())
@@ -349,22 +485,7 @@ impl LlvmCompilingMachine {
             "create setjmp function"
         );
 
-        let entry_function_type = {
-            // *mut LlvmAotCoreMachineData, pointer for the host function to execute
-            let mut args_type = [i64t, i64t];
-            assert_llvm_create!(
-                LLVMFunctionType(i8t, args_type.as_mut_ptr(), args_type.len() as u32, 0),
-                "entry function type"
-            )
-        };
-        let entry_function = assert_llvm_create!(
-            LLVMAddFunction(
-                self.module,
-                cs(&format!("{}____entry____", self.symbol_prefix))?.as_ptr(),
-                entry_function_type
-            ),
-            "create entry function"
-        );
+        let entry_function = self.entry_func;
         let entry_block = assert_llvm_create!(
             LLVMAppendBasicBlockInContext(
                 self.context,
@@ -478,14 +599,6 @@ impl LlvmCompilingMachine {
 
         u!(LLVMBuildRet(self.builder, reason));
 
-        assert_llvm_call!(
-            LLVMVerifyFunction(
-                entry_function,
-                LLVMVerifierFailureAction::LLVMAbortProcessAction
-            ),
-            "verifying entry function".to_string()
-        );
-
         Ok(())
     }
 
@@ -581,14 +694,6 @@ impl LlvmCompilingMachine {
             b"\0".as_ptr() as *const _
         ));
         u!(LLVMBuildUnreachable(self.builder));
-
-        assert_llvm_call!(
-            LLVMVerifyFunction(
-                exit_function,
-                LLVMVerifierFailureAction::LLVMAbortProcessAction
-            ),
-            "verifying exit function".to_string()
-        );
 
         self.exit_func = exit_function;
         Ok(())
@@ -711,6 +816,90 @@ impl LlvmCompilingMachine {
         let i64t = self.i64t()?;
 
         let function = self.emitted_funcs[&func.range.start];
+
+        if let Some(debug_file_writer) = &mut self.debug_file_writer {
+            let di_function_type = {
+                let di_i64t = assert_llvm_create!(
+                    LLVMDIBuilderCreateBasicType(
+                        self.di_builder,
+                        b"uint64\0".as_ptr() as *const _,
+                        5,
+                        64,
+                        0x07, // DW_ATE_unsigned
+                        0
+                    ),
+                    "create basic type"
+                );
+
+                let mut argts = [di_i64t; 16];
+                let return_type = assert_llvm_create!(
+                    LLVMDIBuilderCreateStructType(
+                        self.di_builder,
+                        self.compile_unit,
+                        b"riscv_return_struct\0".as_ptr() as *const _,
+                        19,
+                        self.compile_file,
+                        0, // LineNumber
+                        14 * 64,
+                        0,
+                        0, // Flags
+                        ptr::null_mut(),
+                        argts.as_mut_ptr(),
+                        14,
+                        0,
+                        ptr::null_mut(),
+                        "\0".as_ptr() as *const _,
+                        0
+                    ),
+                    "create di return struct type"
+                );
+                argts[0] = return_type;
+
+                assert_llvm_create!(
+                    LLVMDIBuilderCreateSubroutineType(
+                        self.di_builder,
+                        self.compile_file,
+                        argts.as_mut_ptr(),
+                        16,
+                        0
+                    ),
+                    "create di subroutine type"
+                )
+            };
+
+            let function_name = format!("{}{}", self.symbol_prefix, func.force_name(false));
+            let di_function = assert_llvm_create!(
+                LLVMDIBuilderCreateFunction(
+                    self.di_builder,
+                    self.compile_file,
+                    function_name.as_ptr() as *const _,
+                    function_name.len(),
+                    b"\0".as_ptr() as *const _, // LinkageName,
+                    0,
+                    self.compile_file,
+                    0,
+                    di_function_type, // Ty
+                    0,                // IsLocalToUnit
+                    1,                // IsDefinition
+                    0,
+                    0,
+                    1,
+                ),
+                "create di function"
+            );
+            u!(LLVMSetSubprogram(function, di_function));
+            debug_file_writer.set_scope(di_function);
+            debug_file_writer.write(&format!(
+                "<{} (0x{:x})>:",
+                func.force_name(true),
+                func.range.start,
+            ))?;
+            u!(LLVMSetCurrentDebugLocation2(
+                self.builder,
+                debug_file_writer.debug_location()?,
+            ));
+        }
+
         // This is a dummy entry block in case some jumps point to the start of
         // the function. LLVM does not allow predecessors for entry block.
         let entry_block = assert_llvm_create!(
@@ -901,6 +1090,15 @@ impl LlvmCompilingMachine {
 
             // Emit normal register writes, memory writes
             for (i, write_batch) in block.write_batches.iter().enumerate() {
+                if let Some(debug_file_writer) = &mut self.debug_file_writer {
+                    if let Some(debug_line) = block.debug_lines.get(i) {
+                        debug_file_writer.write(&format!("  {}", debug_line))?;
+                        u!(LLVMSetCurrentDebugLocation2(
+                            self.builder,
+                            debug_file_writer.debug_location()?,
+                        ));
+                    }
+                }
                 let prefix = format!("batch{}", i);
                 self.emit_writes(
                     machine,
@@ -913,6 +1111,15 @@ impl LlvmCompilingMachine {
             }
 
             // Update PC & writes together with PC
+            if let Some(debug_file_writer) = &mut self.debug_file_writer {
+                if let Some(debug_line) = block.debug_lines.get(block.write_batches.len()) {
+                    debug_file_writer.write(&format!("  {}", debug_line))?;
+                    u!(LLVMSetCurrentDebugLocation2(
+                        self.builder,
+                        debug_file_writer.debug_location()?,
+                    ));
+                }
+            }
             let next_pc = self.emit_value(
                 machine,
                 memory_start,
@@ -1398,20 +1605,6 @@ impl LlvmCompilingMachine {
                 )));
             }
         }
-
-        // TODO: Ideally we should use LLVMPrintMessageAction and return an error at
-        // Rust side, but in reality LLVM and Rust will be competing for STDOUT when
-        // printing errors. Using LLVMAbortProcessAction here at least enables us to
-        // see the full generated error message at LLVM side. Later we shall revisit
-        // this to see how we can tackle the problem.
-        assert_llvm_call!(
-            LLVMVerifyFunction(function, LLVMVerifierFailureAction::LLVMAbortProcessAction),
-            &format!(
-                "verifying function {} at 0x{:x}",
-                func.force_name(true),
-                func.range.start
-            )
-        );
 
         Ok(function)
     }
@@ -3196,6 +3389,9 @@ fn llvm_buffer_to_bytes(buf: LLVMMemoryBufferRef) -> Result<Bytes, Error> {
 
 impl Drop for LlvmCompilingMachine {
     fn drop(&mut self) {
+        if !self.di_builder.is_null() {
+            u!(LLVMDisposeDIBuilder(self.di_builder));
+        }
         u!(LLVMDisposeModule(self.module));
         u!(LLVMDisposeBuilder(self.builder));
         u!(LLVMContextDispose(self.context));
@@ -3442,4 +3638,50 @@ lazy_static! {
 
         m
     };
+}
+
+struct DebugFileWriter {
+    context: LLVMContextRef,
+    scope: LLVMMetadataRef,
+    file: File,
+    line: u32,
+}
+
+impl DebugFileWriter {
+    pub fn new(
+        context: LLVMContextRef,
+        scope: LLVMMetadataRef,
+        filename: &str,
+    ) -> Result<Self, Error> {
+        let file = File::create(filename)?;
+        Ok(Self {
+            context,
+            scope,
+            file,
+            line: 0,
+        })
+    }
+
+    pub fn write(&mut self, content: &str) -> Result<(), Error> {
+        write!(self.file, "{}\n", content)?;
+        self.line += 1;
+        Ok(())
+    }
+
+    pub fn debug_location(&mut self) -> Result<LLVMMetadataRef, Error> {
+        Ok(assert_llvm_create!(
+            LLVMDIBuilderCreateDebugLocation(
+                self.context,
+                self.line,
+                0,
+                self.scope,
+                ptr::null_mut(),
+            ),
+            "create debug location"
+        ))
+    }
+
+    pub fn set_scope(&mut self, scope: LLVMMetadataRef) {
+        self.scope = scope;
+    }
 }

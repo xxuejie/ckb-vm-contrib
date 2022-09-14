@@ -38,6 +38,10 @@ struct Args {
     #[clap(long, default_value = "true")]
     optimize: bool,
 
+    /// Generate debug information
+    #[clap(short, long)]
+    debug_info: bool,
+
     /// Running in fast mode
     #[clap(short, long)]
     fast: bool,
@@ -102,6 +106,7 @@ fn main() -> Result<(), Error> {
                 &code,
                 &args.symbol_prefix,
                 &instruction_cycles,
+                args.debug_info,
             )?;
             let bitcode = machine.bitcode(args.optimize)?;
             if args.time {
@@ -174,8 +179,13 @@ fn main() -> Result<(), Error> {
 
 fn build_object(code: &Bytes, args: &Args, output: &str) -> Result<(), Error> {
     let t0 = SystemTime::now();
-    let machine =
-        LlvmCompilingMachine::load(&args.input, &code, &args.symbol_prefix, &instruction_cycles)?;
+    let machine = LlvmCompilingMachine::load(
+        &args.input,
+        &code,
+        &args.symbol_prefix,
+        &instruction_cycles,
+        args.debug_info,
+    )?;
     let object = machine.aot(args.optimize)?;
     if args.time {
         let t1 = SystemTime::now();
