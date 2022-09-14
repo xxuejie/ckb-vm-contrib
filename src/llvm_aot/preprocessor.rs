@@ -9,6 +9,7 @@ use ckb_vm::{
         ast::{ActionOp2, Value},
         execute, extract_opcode, instruction_length, insts, is_basic_block_end_instruction, Utype,
     },
+    machine::InstructionCycleFunc,
     registers::RA,
     Bytes, CoreMachine, DefaultCoreMachine, Error, Memory, Register, SparseMemory, SupportMachine,
 };
@@ -24,6 +25,7 @@ pub struct BasicBlock {
     pub write_batches: Vec<Vec<Write>>,
     pub control: Control,
     pub insts: usize,
+    pub cycles: u64,
 }
 
 impl BasicBlock {
@@ -78,7 +80,10 @@ impl Func {
 /// * Simple optimizations are also perform to simplify writes
 /// The generated data structure after this function will be ready for LLVM
 /// code emitting.
-pub fn preprocess(code: &Bytes) -> Result<Vec<Func>, Error> {
+pub fn preprocess(
+    code: &Bytes,
+    instruction_cycle_func: &InstructionCycleFunc,
+) -> Result<Vec<Func>, Error> {
     let (mut memory, mut decoder): (SparseMemory<u64>, _) = {
         let isa = AOT_ISA;
         let version = AOT_VERSION;
@@ -94,7 +99,13 @@ pub fn preprocess(code: &Bytes) -> Result<Vec<Func>, Error> {
     let func_addresses = funcs.iter().map(|f| f.range.start).collect();
 
     for func in &mut funcs {
-        let blocks = extract_basic_blocks(func, &mut memory, &mut decoder, &func_addresses)?;
+        let blocks = extract_basic_blocks(
+            func,
+            &mut memory,
+            &mut decoder,
+            &func_addresses,
+            instruction_cycle_func,
+        )?;
         func.basic_blocks = blocks;
     }
 
@@ -299,13 +310,20 @@ fn extract_basic_blocks<M: Memory>(
     memory: &mut M,
     decoder: &mut AuxDecoder,
     func_addresses: &HashSet<u64>,
+    instruction_cycle_func: &InstructionCycleFunc,
 ) -> Result<Vec<BasicBlock>, Error> {
     let mut blocks = vec![];
     let mut targets: HashSet<u64> = HashSet::default();
     let mut pc = func.range.start;
     while pc < func.range.end {
-        let (block, block_end) =
-            parse_basic_block(memory, decoder, pc, func.range.end, func_addresses)?;
+        let (block, block_end) = parse_basic_block(
+            memory,
+            decoder,
+            pc,
+            func.range.end,
+            func_addresses,
+            instruction_cycle_func,
+        )?;
         pc = block_end;
 
         if let Some(block) = block {
@@ -333,10 +351,22 @@ fn extract_basic_blocks<M: Memory>(
             let splitted_blocks = {
                 let block = &blocks[i];
 
-                let (block1, _) =
-                    parse_basic_block(memory, decoder, block.range.start, *target, func_addresses)?;
-                let (block2, _) =
-                    parse_basic_block(memory, decoder, *target, block.range.end, func_addresses)?;
+                let (block1, _) = parse_basic_block(
+                    memory,
+                    decoder,
+                    block.range.start,
+                    *target,
+                    func_addresses,
+                    instruction_cycle_func,
+                )?;
+                let (block2, _) = parse_basic_block(
+                    memory,
+                    decoder,
+                    *target,
+                    block.range.end,
+                    func_addresses,
+                    instruction_cycle_func,
+                )?;
 
                 let mut splitted_blocks = vec![];
                 if let Some(block) = block1 {
@@ -367,6 +397,7 @@ fn parse_basic_block<M: Memory>(
     block_start: u64,
     block_maximum_end: u64,
     func_addresses: &HashSet<u64>,
+    instruction_cycle_func: &InstructionCycleFunc,
 ) -> Result<(Option<BasicBlock>, u64), Error> {
     let mut insts = vec![];
     let mut invalid = false;
@@ -441,15 +472,18 @@ fn parse_basic_block<M: Memory>(
     ast_machine.update_pc(Value::from_u64(block_start));
     ast_machine.commit_pc();
     let len = insts.len();
+    let mut cycles = 0;
     let mut write_batches = Vec::with_capacity(len - 1);
     // The above code has asserted that insts cannot be empty
     let last_inst = insts.pop().unwrap();
     for inst in insts {
+        cycles += instruction_cycle_func(inst);
         execute(inst, &mut ast_machine)?;
         write_batches.push(ast_machine.take_writes());
         ast_machine.reset_registers();
     }
 
+    cycles += instruction_cycle_func(last_inst);
     execute(last_inst, &mut ast_machine)?;
     let last_pc = simplify_with_writes(
         ast_machine.pc(),
@@ -495,6 +529,7 @@ fn parse_basic_block<M: Memory>(
         write_batches,
         control,
         insts: len,
+        cycles,
     };
 
     Ok((Some(block), pc))

@@ -4,15 +4,16 @@ use super::{
     preprocessor::{preprocess, Func},
     runner::{
         LlvmAotCoreMachineData, LlvmAotMachineEnv, EXIT_REASON_BARE_CALL_EXIT,
-        EXIT_REASON_EBREAK_UNREACHABLE, EXIT_REASON_ECALL_UNREACHABLE,
+        EXIT_REASON_CYCLES_OVERFLOW, EXIT_REASON_EBREAK_UNREACHABLE, EXIT_REASON_ECALL_UNREACHABLE,
         EXIT_REASON_MALFORMED_INDIRECT_CALL, EXIT_REASON_MALFORMED_RETURN,
-        EXIT_REASON_UNKNOWN_BLOCK, EXIT_REASON_UNKNOWN_PC_VALUE,
+        EXIT_REASON_MAX_CYCLES_EXCEEDED, EXIT_REASON_UNKNOWN_BLOCK, EXIT_REASON_UNKNOWN_PC_VALUE,
         EXIT_REASON_UNKNOWN_RESUME_ADDRESS,
     },
     utils::cs,
 };
 use ckb_vm::{
     instructions::ast::{ActionOp1, ActionOp2, SignActionOp2, Value},
+    machine::InstructionCycleFunc,
     Bytes, Error, Register,
 };
 use ckb_vm_definitions::registers;
@@ -82,12 +83,17 @@ impl LlvmCompilingMachine {
     // TODO: memory leaks might occur in case of errors. We will need to
     // build wrappers on pointer types or switch to a higher level crate
     // than llvm-sys.
-    pub fn load(name: &str, code: &Bytes, symbol_prefix: &str) -> Result<Self, Error> {
+    pub fn load(
+        name: &str,
+        code: &Bytes,
+        symbol_prefix: &str,
+        instruction_cycle_func: &InstructionCycleFunc,
+    ) -> Result<Self, Error> {
         let name = Path::new(name)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(name);
-        let funcs = preprocess(code)?;
+        let funcs = preprocess(code, instruction_cycle_func)?;
         let context = assert_llvm_create!(LLVMContextCreate(), "context");
         let module = assert_llvm_create!(
             LLVMModuleCreateWithNameInContext(
@@ -790,6 +796,108 @@ impl LlvmCompilingMachine {
                 self.builder,
                 basic_blocks[&block.range.start]
             ));
+
+            // Emit cycle calculation logic
+            let current_cycles = self.emit_load_from_machine(
+                machine,
+                offset_of!(LlvmAotCoreMachineData, cycles),
+                i64t,
+                Some("current_cycles"),
+            )?;
+            let max_cycles = self.emit_load_from_machine(
+                machine,
+                offset_of!(LlvmAotCoreMachineData, max_cycles),
+                i64t,
+                Some("max_cycles"),
+            )?;
+            let updated_cycles = u!(LLVMBuildAdd(
+                self.builder,
+                current_cycles,
+                LLVMConstInt(i64t, block.cycles, 0),
+                b"updated_cycles\0".as_ptr() as *const _,
+            ));
+            let cycle_overflow_cmp = u!(LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntULT,
+                updated_cycles,
+                current_cycles,
+                b"cycle_overflow_cmp\0".as_ptr() as *const _,
+            ));
+            let cycle_exceeded_cmp = u!(LLVMBuildICmp(
+                self.builder,
+                LLVMIntPredicate::LLVMIntUGT,
+                updated_cycles,
+                max_cycles,
+                b"cycle_exceeded_cmp\0".as_ptr() as *const _,
+            ));
+            let cycle_overflow_block = assert_llvm_create!(
+                LLVMCreateBasicBlockInContext(
+                    self.context,
+                    cs(&format!("cycle_overflow_block_0x{:x}", block.range.start))?.as_ptr(),
+                ),
+                "create cycle overflow block"
+            );
+            u!(LLVMAppendExistingBasicBlock(function, cycle_overflow_block));
+            let cycle_no_overflow_block = assert_llvm_create!(
+                LLVMCreateBasicBlockInContext(
+                    self.context,
+                    cs(&format!(
+                        "cycle_no_overflow_block_0x{:x}",
+                        block.range.start
+                    ))?
+                    .as_ptr(),
+                ),
+                "create cycle no overflow block"
+            );
+            u!(LLVMAppendExistingBasicBlock(
+                function,
+                cycle_no_overflow_block
+            ));
+            let cycle_exceeded_block = assert_llvm_create!(
+                LLVMCreateBasicBlockInContext(
+                    self.context,
+                    cs(&format!("cycle_exceeded_block_0x{:x}", block.range.start))?.as_ptr(),
+                ),
+                "create cycle exceeded block"
+            );
+            u!(LLVMAppendExistingBasicBlock(function, cycle_exceeded_block));
+            let cycle_ok_block = assert_llvm_create!(
+                LLVMCreateBasicBlockInContext(
+                    self.context,
+                    cs(&format!("cycle_ok_block_0x{:x}", block.range.start))?.as_ptr(),
+                ),
+                "create cycle ok block"
+            );
+            u!(LLVMAppendExistingBasicBlock(function, cycle_ok_block));
+
+            u!(LLVMBuildCondBr(
+                self.builder,
+                cycle_overflow_cmp,
+                cycle_overflow_block,
+                cycle_no_overflow_block,
+            ));
+            u!(LLVMPositionBuilderAtEnd(self.builder, cycle_overflow_block));
+            self.emit_call_exit(machine, EXIT_REASON_CYCLES_OVERFLOW, &vars)?;
+            u!(LLVMPositionBuilderAtEnd(
+                self.builder,
+                cycle_no_overflow_block
+            ));
+            u!(LLVMBuildCondBr(
+                self.builder,
+                cycle_exceeded_cmp,
+                cycle_exceeded_block,
+                cycle_ok_block,
+            ));
+            u!(LLVMPositionBuilderAtEnd(self.builder, cycle_exceeded_block));
+            self.emit_call_exit(machine, EXIT_REASON_MAX_CYCLES_EXCEEDED, &vars)?;
+            u!(LLVMPositionBuilderAtEnd(self.builder, cycle_ok_block));
+            self.emit_store_to_machine(
+                machine,
+                updated_cycles,
+                offset_of!(LlvmAotCoreMachineData, cycles),
+                i64t,
+                Some("updated_cycles"),
+            )?;
 
             // Emit normal register writes, memory writes
             for (i, write_batch) in block.write_batches.iter().enumerate() {

@@ -1,4 +1,8 @@
-use ckb_vm::{machine::DefaultMachineBuilder, Bytes, Error};
+use ckb_vm::{
+    instructions::{extract_opcode, insts},
+    machine::DefaultMachineBuilder,
+    Bytes, Error, Instruction, SupportMachine,
+};
 use ckb_vm_contrib::{
     llvm_aot::{
         ast::Control, preprocess, DlSymbols, Func, LlvmAotCoreMachine, LlvmAotMachine,
@@ -37,6 +41,10 @@ struct Args {
     /// Running in fast mode
     #[clap(short, long)]
     fast: bool,
+
+    /// Max cycles when running the program
+    #[clap(short, long, default_value = "18446744073709551615")]
+    max_cycles: u64,
 
     /// CKB-VM memory size to use when running the program
     #[clap(short, long, default_value = "4194304")]
@@ -84,12 +92,17 @@ fn main() -> Result<(), Error> {
                 Some(s) if s == "-" => Box::new(io::stdout()),
                 Some(o) => Box::new(File::create(&o)?),
             };
-            let funcs = preprocess(&code)?;
+            let funcs = preprocess(&code, &instruction_cycles)?;
             dump_funcs(output, &funcs)?;
         }
         Generate::Bitcode => {
             let t0 = SystemTime::now();
-            let machine = LlvmCompilingMachine::load(&args.input, &code, &args.symbol_prefix)?;
+            let machine = LlvmCompilingMachine::load(
+                &args.input,
+                &code,
+                &args.symbol_prefix,
+                &instruction_cycles,
+            )?;
             let bitcode = machine.bitcode(args.optimize)?;
             if args.time {
                 let t1 = SystemTime::now();
@@ -122,10 +135,12 @@ fn main() -> Result<(), Error> {
             let aot_symbols = &dl_symbols.aot_symbols;
             let core_machine =
                 DefaultMachineBuilder::new(LlvmAotCoreMachine::new(args.memory_size)?)
+                    .instruction_cycle_func(Box::new(instruction_cycles))
                     .syscall(Box::new(DebugSyscall {}))
                     .syscall(Box::new(TimeSyscall::new()))
                     .build();
             let mut machine = LlvmAotMachine::new_with_machine(core_machine, &aot_symbols)?;
+            machine.set_max_cycles(args.max_cycles);
             let run_args: Vec<Bytes> = args
                 .run_args
                 .iter()
@@ -144,7 +159,7 @@ fn main() -> Result<(), Error> {
                     println!("Run error encountered: {:?}", e);
                     println!("Machine: {}", machine.machine);
                 }
-                Ok(0) => (),
+                Ok(0) => println!("Cycles: {}", machine.machine.cycles()),
                 Ok(i) => {
                     println!("Non-zero exit code: {}", i);
                     println!("Machine: {}", machine.machine);
@@ -159,7 +174,8 @@ fn main() -> Result<(), Error> {
 
 fn build_object(code: &Bytes, args: &Args, output: &str) -> Result<(), Error> {
     let t0 = SystemTime::now();
-    let machine = LlvmCompilingMachine::load(&args.input, &code, &args.symbol_prefix)?;
+    let machine =
+        LlvmCompilingMachine::load(&args.input, &code, &args.symbol_prefix, &instruction_cycles)?;
     let object = machine.aot(args.optimize)?;
     if args.time {
         let t1 = SystemTime::now();
@@ -244,4 +260,53 @@ fn dump_control(o: &mut Box<dyn Write>, control: &Control, funcs: &[Func]) -> Re
     };
     write!(o, "    {}\n", control)?;
     Ok(())
+}
+
+pub fn instruction_cycles(i: Instruction) -> u64 {
+    match extract_opcode(i) {
+        // IMC
+        insts::OP_JALR => 3,
+        insts::OP_LD => 2,
+        insts::OP_LW => 3,
+        insts::OP_LH => 3,
+        insts::OP_LB => 3,
+        insts::OP_LWU => 3,
+        insts::OP_LHU => 3,
+        insts::OP_LBU => 3,
+        insts::OP_SB => 3,
+        insts::OP_SH => 3,
+        insts::OP_SW => 3,
+        insts::OP_SD => 2,
+        insts::OP_BEQ => 3,
+        insts::OP_BGE => 3,
+        insts::OP_BGEU => 3,
+        insts::OP_BLT => 3,
+        insts::OP_BLTU => 3,
+        insts::OP_BNE => 3,
+        insts::OP_EBREAK => 500,
+        insts::OP_ECALL => 500,
+        insts::OP_JAL => 3,
+        insts::OP_MUL => 5,
+        insts::OP_MULW => 5,
+        insts::OP_MULH => 5,
+        insts::OP_MULHU => 5,
+        insts::OP_MULHSU => 5,
+        insts::OP_DIV => 32,
+        insts::OP_DIVW => 32,
+        insts::OP_DIVU => 32,
+        insts::OP_DIVUW => 32,
+        insts::OP_REM => 32,
+        insts::OP_REMW => 32,
+        insts::OP_REMU => 32,
+        insts::OP_REMUW => 32,
+        // MOP
+        insts::OP_WIDE_MUL => 5,
+        insts::OP_WIDE_MULU => 5,
+        insts::OP_WIDE_MULSU => 5,
+        insts::OP_WIDE_DIV => 32,
+        insts::OP_WIDE_DIVU => 32,
+        insts::OP_FAR_JUMP_REL => 3,
+        insts::OP_FAR_JUMP_ABS => 3,
+        _ => 1,
+    }
 }

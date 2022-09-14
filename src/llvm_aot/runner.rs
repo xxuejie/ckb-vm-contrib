@@ -25,6 +25,8 @@ pub const EXIT_REASON_UNKNOWN_RESUME_ADDRESS: u8 = 5;
 pub const EXIT_REASON_MALFORMED_RETURN: u8 = 6;
 pub const EXIT_REASON_MALFORMED_INDIRECT_CALL: u8 = 7;
 pub const EXIT_REASON_BARE_CALL_EXIT: u8 = 101;
+pub const EXIT_REASON_MAX_CYCLES_EXCEEDED: u8 = 102;
+pub const EXIT_REASON_CYCLES_OVERFLOW: u8 = 103;
 
 pub struct LlvmAotMachine {
     pub machine: DefaultMachine<LlvmAotCoreMachine>,
@@ -150,6 +152,10 @@ impl LlvmAotMachine {
         })
     }
 
+    pub fn set_max_cycles(&mut self, cycles: u64) {
+        self.machine.inner_mut().data.max_cycles = cycles;
+    }
+
     pub fn load_program(&mut self, program: &Bytes, args: &[Bytes]) -> Result<u64, Error> {
         let program_hash: [u8; 32] = blake3::hash(program).into();
         if program_hash != self.code_hash {
@@ -186,7 +192,14 @@ impl LlvmAotMachine {
                     | EXIT_REASON_UNKNOWN_PC_VALUE
                     | EXIT_REASON_UNKNOWN_RESUME_ADDRESS
                     | EXIT_REASON_MALFORMED_RETURN
-                    | EXIT_REASON_MALFORMED_INDIRECT_CALL => (),
+                    | EXIT_REASON_MALFORMED_INDIRECT_CALL => {
+                        if fast_mode && self.machine.running() {
+                            return Err(Error::External(format!(
+                                "Fast mode exit with: {}",
+                                result
+                            )));
+                        }
+                    }
                     EXIT_REASON_BARE_CALL_EXIT => {
                         if self.machine.running() {
                             return Err(Error::External(
@@ -195,10 +208,13 @@ impl LlvmAotMachine {
                             ));
                         }
                     }
+                    EXIT_REASON_MAX_CYCLES_EXCEEDED => {
+                        return Err(Error::CyclesExceeded);
+                    }
+                    EXIT_REASON_CYCLES_OVERFLOW => {
+                        return Err(Error::CyclesOverflow);
+                    }
                     _ => return Err(Error::Asm(result)),
-                }
-                if fast_mode && self.machine.running() {
-                    return Err(Error::External(format!("Fast mode exit with: {}", result)));
                 }
             } else {
                 self.step()?;
@@ -228,6 +244,8 @@ impl LlvmAotMachine {
 pub struct LlvmAotCoreMachineData {
     pub pc: u64,
     pub memory: *mut u8,
+    pub cycles: u64,
+    pub max_cycles: u64,
     pub registers: [u64; RISCV_GENERAL_REGISTER_NUMBER],
     pub last_ra: u64,
     pub next_pc: u64,
@@ -259,6 +277,8 @@ impl LlvmAotCoreMachine {
         let data = LlvmAotCoreMachineData {
             pc: 0,
             memory: memory.as_mut_ptr(),
+            cycles: 0,
+            max_cycles: 0,
             registers: [0u64; RISCV_GENERAL_REGISTER_NUMBER],
             last_ra: 0,
             next_pc: 0,
@@ -349,13 +369,15 @@ impl CoreMachine for LlvmAotCoreMachine {
 
 impl SupportMachine for LlvmAotCoreMachine {
     fn cycles(&self) -> u64 {
-        0
+        self.data.cycles
     }
 
-    fn set_cycles(&mut self, _cycles: u64) {}
+    fn set_cycles(&mut self, cycles: u64) {
+        self.data.cycles = cycles;
+    }
 
     fn max_cycles(&self) -> u64 {
-        0
+        self.data.max_cycles
     }
 
     fn running(&self) -> bool {
