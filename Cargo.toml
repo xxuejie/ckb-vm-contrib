@@ -20,8 +20,8 @@ llvm-aot = [
 ]
 
 [dependencies]
-ckb-vm = "0.21.6"
-ckb-vm-definitions = "0.21.6"
+ckb-vm = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "7dc3efb" }
+ckb-vm-definitions = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "7dc3efb" }
 goblin = "=0.4.0"
 lazy_static = "1.4.0"
 log = "0.4.17"

@@ -217,6 +217,10 @@ impl<R: Register> Memory for VecMemory<R> {
         Err(Error::Unimplemented)
     }
 
+    fn load_bytes(&mut self, _addr: u64, _size: u64) -> Result<Vec<u8>, Error> {
+        Err(Error::Unimplemented)
+    }
+
     fn store64(&mut self, _addr: &Self::REG, _value: &Self::REG) -> Result<(), Error> {
         Err(Error::Unimplemented)
     }
