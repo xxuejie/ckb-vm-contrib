@@ -1,14 +1,17 @@
+pub mod b;
 pub mod i;
 pub mod m;
 pub mod rvc;
 mod utils;
 
 use ckb_vm::{
-    instructions::{tagged::TaggedInstruction, Itype, RegisterIndex, Rtype, Stype, Utype},
+    instructions::{
+        blank_instruction, tagged::TaggedInstruction, Itype, RegisterIndex, Rtype, Stype, Utype,
+    },
     Error, Register,
 };
 use ckb_vm_definitions::{
-    instructions::{self as opcodes, InstructionOpcode},
+    instructions::{self as opcodes, instruction_opcode_name, InstructionOpcode},
     registers::REGISTER_ABI_NAMES,
 };
 use lazy_static::lazy_static;
@@ -83,6 +86,7 @@ pub fn assemble<R: Register>(insts: &[TaggedInstruction]) -> Result<Vec<u8>, Err
     assembler.add_assembler_factory(rvc::assembler::<R>);
     assembler.add_assembler_factory(i::assembler::<R>);
     assembler.add_assembler_factory(m::assembler::<R>);
+    assembler.add_assembler_factory(b::assembler::<R>);
 
     let mut content = Vec::new();
     for inst in insts {
@@ -96,79 +100,35 @@ lazy_static! {
     static ref TOKENS_RE: Regex = Regex::new(r#"[^\s,\(\)]+"#).expect("regex");
     static ref COMMENT_RE: Regex = Regex::new("#.*$").expect("regex");
     static ref REG_NAME_RE: Regex = Regex::new("^x([0-9]{1,2})$").expect("regex");
-    static ref PARSER_FUNCS: HashMap<&'static str, (InstructionOpcode, ParserFunc)> = {
+    static ref PARSER_FUNCS: HashMap<String, (InstructionOpcode, ParserFunc)> = {
         let mut m = HashMap::new();
-        // I type
-        m.insert("lb", (opcodes::OP_LB, parse_itype as ParserFunc));
-        m.insert("lh", (opcodes::OP_LH, parse_itype as ParserFunc));
-        m.insert("lw", (opcodes::OP_LW, parse_itype as ParserFunc));
-        m.insert("ld", (opcodes::OP_LD, parse_itype as ParserFunc));
-        m.insert("lbu", (opcodes::OP_LBU, parse_itype as ParserFunc));
-        m.insert("lhu", (opcodes::OP_LHU, parse_itype as ParserFunc));
-        m.insert("lwu", (opcodes::OP_LWU, parse_itype as ParserFunc));
-        m.insert("addi", (opcodes::OP_ADDI, parse_itype as ParserFunc));
-        m.insert("slti", (opcodes::OP_SLTI, parse_itype as ParserFunc));
-        m.insert("sltiu", (opcodes::OP_SLTIU, parse_itype as ParserFunc));
-        m.insert("xori", (opcodes::OP_XORI, parse_itype as ParserFunc));
-        m.insert("ori", (opcodes::OP_ORI, parse_itype as ParserFunc));
-        m.insert("andi", (opcodes::OP_ANDI, parse_itype as ParserFunc));
-        m.insert("slli", (opcodes::OP_SLLI, parse_itype as ParserFunc));
-        m.insert("srli", (opcodes::OP_SRLI, parse_itype as ParserFunc));
-        m.insert("srai", (opcodes::OP_SRAI, parse_itype as ParserFunc));
-        m.insert("addiw", (opcodes::OP_ADDIW, parse_itype as ParserFunc));
-        m.insert("slliw", (opcodes::OP_SLLIW, parse_itype as ParserFunc));
-        m.insert("srliw", (opcodes::OP_SRLIW, parse_itype as ParserFunc));
-        m.insert("sraiw", (opcodes::OP_SRAIW, parse_itype as ParserFunc));
-        m.insert("jalr", (opcodes::OP_JALR, parse_itype as ParserFunc));
-        // R type
-        m.insert("add", (opcodes::OP_ADD, parse_rtype as ParserFunc));
-        m.insert("sub", (opcodes::OP_SUB, parse_rtype as ParserFunc));
-        m.insert("sll", (opcodes::OP_SLL, parse_rtype as ParserFunc));
-        m.insert("slt", (opcodes::OP_SLT, parse_rtype as ParserFunc));
-        m.insert("sltu", (opcodes::OP_SLTU, parse_rtype as ParserFunc));
-        m.insert("xor", (opcodes::OP_XOR, parse_rtype as ParserFunc));
-        m.insert("srl", (opcodes::OP_SRL, parse_rtype as ParserFunc));
-        m.insert("sra", (opcodes::OP_SRA, parse_rtype as ParserFunc));
-        m.insert("or", (opcodes::OP_OR, parse_rtype as ParserFunc));
-        m.insert("and", (opcodes::OP_AND, parse_rtype as ParserFunc));
-        m.insert("addw", (opcodes::OP_ADDW, parse_rtype as ParserFunc));
-        m.insert("subw", (opcodes::OP_SUBW, parse_rtype as ParserFunc));
-        m.insert("sllw", (opcodes::OP_SLLW, parse_rtype as ParserFunc));
-        m.insert("srlw", (opcodes::OP_SRLW, parse_rtype as ParserFunc));
-        m.insert("sraw", (opcodes::OP_SRAW, parse_rtype as ParserFunc));
-        m.insert("mul", (opcodes::OP_MUL, parse_rtype as ParserFunc));
-        m.insert("mulw", (opcodes::OP_MULW, parse_rtype as ParserFunc));
-        m.insert("mulh", (opcodes::OP_MULH, parse_rtype as ParserFunc));
-        m.insert("mulhsu", (opcodes::OP_MULHSU, parse_rtype as ParserFunc));
-        m.insert("mulhu", (opcodes::OP_MULHU, parse_rtype as ParserFunc));
-        m.insert("div", (opcodes::OP_DIV, parse_rtype as ParserFunc));
-        m.insert("divw", (opcodes::OP_DIVW, parse_rtype as ParserFunc));
-        m.insert("divu", (opcodes::OP_DIVU, parse_rtype as ParserFunc));
-        m.insert("divuw", (opcodes::OP_DIVUW, parse_rtype as ParserFunc));
-        m.insert("rem", (opcodes::OP_REM, parse_rtype as ParserFunc));
-        m.insert("remw", (opcodes::OP_REMW, parse_rtype as ParserFunc));
-        m.insert("remu", (opcodes::OP_REMU, parse_rtype as ParserFunc));
-        m.insert("remuw", (opcodes::OP_REMUW, parse_rtype as ParserFunc));
-        // S type
-        m.insert("beq", (opcodes::OP_BEQ, parse_btype as ParserFunc));
-        m.insert("bne", (opcodes::OP_BNE, parse_btype as ParserFunc));
-        m.insert("blt", (opcodes::OP_BLT, parse_btype as ParserFunc));
-        m.insert("bge", (opcodes::OP_BGE, parse_btype as ParserFunc));
-        m.insert("bltu", (opcodes::OP_BLTU, parse_btype as ParserFunc));
-        m.insert("bgeu", (opcodes::OP_BGEU, parse_btype as ParserFunc));
-        m.insert("sb", (opcodes::OP_SB, parse_stype as ParserFunc));
-        m.insert("sh", (opcodes::OP_SH, parse_stype as ParserFunc));
-        m.insert("sw", (opcodes::OP_SW, parse_stype as ParserFunc));
-        m.insert("sd", (opcodes::OP_SD, parse_stype as ParserFunc));
-        // U type
-        m.insert("lui", (opcodes::OP_LUI, parse_utype as ParserFunc));
-        m.insert("auipc", (opcodes::OP_AUIPC, parse_utype as ParserFunc));
-        m.insert("jal", (opcodes::OP_JAL, parse_utype as ParserFunc));
-        // noarg type
-        m.insert("ecall", (opcodes::OP_ECALL, parse_noarg_rtype as ParserFunc));
-        m.insert("ebreak", (opcodes::OP_EBREAK, parse_noarg_rtype as ParserFunc));
-        m.insert("fence", (opcodes::OP_FENCE, parse_noarg_rtype as ParserFunc));
-        m.insert("fencei", (opcodes::OP_FENCEI, parse_noarg_rtype as ParserFunc));
+        // noarg types
+        m.insert("ecall".to_string(), (opcodes::OP_ECALL, parse_noarg_rtype as ParserFunc));
+        m.insert("ebreak".to_string(), (opcodes::OP_EBREAK, parse_noarg_rtype as ParserFunc));
+        m.insert("fencei".to_string(), (opcodes::OP_FENCEI, parse_noarg_rtype as ParserFunc));
+        // B types
+        m.insert("beq".to_string(), (opcodes::OP_BEQ, parse_btype as ParserFunc));
+        m.insert("bne".to_string(), (opcodes::OP_BNE, parse_btype as ParserFunc));
+        m.insert("blt".to_string(), (opcodes::OP_BLT, parse_btype as ParserFunc));
+        m.insert("bge".to_string(), (opcodes::OP_BGE, parse_btype as ParserFunc));
+        m.insert("bltu".to_string(), (opcodes::OP_BLTU, parse_btype as ParserFunc));
+        m.insert("bgeu".to_string(), (opcodes::OP_BGEU, parse_btype as ParserFunc));
+
+        for op in opcodes::OP_UNLOADED..=opcodes::OP_CUSTOM_TRACE_END {
+            let name = instruction_opcode_name(op).to_lowercase();
+            if !m.contains_key(&name) {
+                let f = match TaggedInstruction::try_from(blank_instruction(op)) {
+                    Ok(TaggedInstruction::Rtype(_)) => Some(parse_rtype as ParserFunc),
+                    Ok(TaggedInstruction::Itype(_)) => Some(parse_itype as ParserFunc),
+                    Ok(TaggedInstruction::Stype(_)) => Some(parse_stype as ParserFunc),
+                    Ok(TaggedInstruction::Utype(_)) => Some(parse_utype as ParserFunc),
+                    _ => None,
+                };
+                if let Some(f) = f {
+                    m.insert(name, (op, f));
+                }
+            }
+        }
         m
     };
 }
@@ -208,6 +168,9 @@ fn parse_rtype(
     opcode: InstructionOpcode,
     stream: &mut InstrStream,
 ) -> Result<TaggedInstruction, Error> {
+    if opcode == opcodes::OP_FENCE && stream.remaining() == 0 {
+        return Ok(Rtype::new(opcode, 0, 0b1111, 0b1111).into());
+    }
     let rd = stream.next_register()?;
     let rs1 = stream.next_register()?;
     let rs2 = stream.next_register()?;
