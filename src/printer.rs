@@ -1,5 +1,5 @@
 use ckb_vm::instructions::{
-    extract_opcode, tagged::TaggedInstruction, Instruction, InstructionOpcode,
+    extract_opcode, tagged::TaggedInstruction, Instruction, InstructionOpcode, Utype,
 };
 use ckb_vm_definitions::instructions as opcodes;
 use core::fmt;
@@ -30,6 +30,13 @@ impl InstructionPrinter {
 impl fmt::Display for InstructionPrinter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.opcode() {
+            opcodes::OP_LUI | opcodes::OP_AUIPC => {
+                if let TaggedInstruction::Utype(i) = self.0 {
+                    let shifted = Utype::new(i.op(), i.rd(), i.immediate_u() >> 12);
+                    return shifted.fmt(f);
+                }
+                self.0.fmt(f)
+            }
             opcodes::OP_ECALL => write!(f, "ecall"),
             opcodes::OP_EBREAK => write!(f, "ebreak"),
             opcodes::OP_FENCEI => write!(f, "fencei"),

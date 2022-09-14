@@ -1,10 +1,33 @@
 mod utils;
 
 use ckb_vm::instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype, Utype};
-use ckb_vm_contrib::{assembler::parse, printer::InstructionPrinter};
+use ckb_vm_contrib::{
+    assembler::{assemble, parse},
+    printer::InstructionPrinter,
+};
 use ckb_vm_definitions::instructions as opcodes;
 use proptest::prelude::*;
 use utils::*;
+
+#[test]
+fn test_auipc_shifts() {
+    let text = "auipc   a0,0x7ffff";
+
+    let insts = parse::<u64>(text).expect("parsing");
+    let binary = assemble::<u64>(&insts).expect("assemble");
+
+    assert_eq!(binary, [0x17, 0xf5, 0xff, 0x7f]);
+}
+
+#[test]
+fn test_lui_shifts() {
+    let text = "lui   gp,0x7ffff";
+
+    let insts = parse::<u64>(text).expect("parsing");
+    let binary = assemble::<u64>(&insts).expect("assemble");
+
+    assert_eq!(binary, [0xb7, 0xf1, 0xff, 0x7f]);
+}
 
 fn t<T: Into<TaggedInstruction>>(i: T) {
     let i: TaggedInstruction = i.into();

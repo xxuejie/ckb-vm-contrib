@@ -235,7 +235,10 @@ fn parse_utype(
         return Ok(Utype::new(opcode, 1, immediate as u32).into());
     }
     let rd = stream.next_register()?;
-    let immediate = stream.next_number()?;
+    let mut immediate = stream.next_number()?;
+    if opcode == opcodes::OP_LUI || opcode == opcodes::OP_AUIPC {
+        immediate = immediate << 12;
+    }
     Ok(Utype::new(opcode, rd, immediate as u32).into())
 }
 

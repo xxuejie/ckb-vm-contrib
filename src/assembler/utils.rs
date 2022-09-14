@@ -56,7 +56,7 @@ pub fn jtype_immediate(immediate: i32) -> u32 {
 
 #[inline(always)]
 pub fn utype_immediate(immediate: i32) -> u32 {
-    (immediate as u32) & 0xFFFFF000
+    (((immediate as u32) >> 12) & 0xFFFFF) << 12
 }
 
 #[inline(always)]
