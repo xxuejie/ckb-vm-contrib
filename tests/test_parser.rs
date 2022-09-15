@@ -29,6 +29,16 @@ fn test_lui_shifts() {
     assert_eq!(binary, [0xb7, 0xf1, 0xff, 0x7f]);
 }
 
+#[test]
+fn test_beqz_parsing() {
+    let text = "beqz s6,2168";
+
+    let insts = parse::<u64>(text).expect("parsing");
+    let binary = assemble::<u64>(&insts).expect("assemble");
+
+    assert_eq!(binary, [0xe3, 0x0c, 0x0b, 0x06]);
+}
+
 fn t<T: Into<TaggedInstruction>>(i: T) {
     let i: TaggedInstruction = i.into();
     let text = format!("{}", InstructionPrinter::new(i.clone()));

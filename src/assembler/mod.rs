@@ -369,7 +369,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BEQ,
-                offset as u32 >> 1,
+                offset as u32,
                 rs,
                 0,
             )
@@ -380,7 +380,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BNE,
-                offset as u32 >> 1,
+                offset as u32,
                 rs,
                 0,
             )
@@ -391,7 +391,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BGE,
-                offset as u32 >> 1,
+                offset as u32,
                 0,
                 rs,
             )
@@ -402,7 +402,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BGE,
-                offset as u32 >> 1,
+                offset as u32,
                 rs,
                 0,
             )
@@ -413,7 +413,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BLT,
-                offset as u32 >> 1,
+                offset as u32,
                 rs,
                 0,
             )
@@ -424,7 +424,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BLT,
-                offset as u32 >> 1,
+                offset as u32,
                 0,
                 rs,
             )
@@ -436,7 +436,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BLT,
-                offset as u32 >> 1,
+                offset as u32,
                 rt,
                 rs,
             )
@@ -448,7 +448,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BGE,
-                offset as u32 >> 1,
+                offset as u32,
                 rt,
                 rs,
             )
@@ -460,7 +460,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BLTU,
-                offset as u32 >> 1,
+                offset as u32,
                 rt,
                 rs,
             )
@@ -472,7 +472,7 @@ fn parse_pseudoinstructions<R: Register>(
             let offset = stream.next_number_with_mask(0x1FFE)?;
             Ok(Some(vec![Stype::new_u(
                 opcodes::OP_BGEU,
-                offset as u32 >> 1,
+                offset as u32,
                 rt,
                 rs,
             )
