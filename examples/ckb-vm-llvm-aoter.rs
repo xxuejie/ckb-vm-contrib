@@ -325,7 +325,7 @@ pub fn instruction_cycles(i: Instruction) -> u64 {
 }
 
 fn find_linker() -> PathBuf {
-    for candidate in ["ld.lld-14", "ld", "ld.lld"] {
+    for candidate in ["ld.lld-15", "ld", "ld.lld"] {
         if let Ok(path) = which(candidate) {
             info!("Use linker from {:?}", path);
             return path;
