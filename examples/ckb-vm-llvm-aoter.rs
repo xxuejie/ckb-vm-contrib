@@ -11,11 +11,14 @@ use ckb_vm_contrib::{
     syscalls::{DebugSyscall, TimeSyscall},
 };
 use clap::{Parser, ValueEnum};
+use log::info;
 use std::fs::File;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::SystemTime;
 use tempfile::Builder;
+use which::which;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Generate {
@@ -197,7 +200,7 @@ fn build_object(code: &Bytes, args: &Args, output: &str) -> Result<(), Error> {
 }
 
 fn build_shared_library(input: &str, output: &str) -> Result<(), Error> {
-    let mut cmd = Command::new("gcc");
+    let mut cmd = Command::new(find_linker());
     cmd.arg("-shared").arg("-o").arg(output).arg(input);
     let output = cmd
         .output()
@@ -319,4 +322,14 @@ pub fn instruction_cycles(i: Instruction) -> u64 {
         insts::OP_FAR_JUMP_ABS => 3,
         _ => 1,
     }
+}
+
+fn find_linker() -> PathBuf {
+    for candidate in ["ld.lld-14", "ld", "ld.lld"] {
+        if let Ok(path) = which(candidate) {
+            info!("Use linker from {:?}", path);
+            return path;
+        }
+    }
+    panic!("Cannot find a linker to use! Please install either lld from LLVM or ld from GNU toolchain!");
 }

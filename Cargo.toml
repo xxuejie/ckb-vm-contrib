@@ -40,6 +40,7 @@ proptest = "1.0.0"
 flexi_logger = "0.23.0"
 clap = { version = "3.2.20", features = ["derive"] }
 tempfile = "3.3.0"
+which = "4.3.0"
 
 [[example]]
 name = "ckb-vm-llvm-aoter"
