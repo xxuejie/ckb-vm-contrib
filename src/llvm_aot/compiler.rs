@@ -93,17 +93,17 @@ impl LlvmCompilingMachine {
     // build wrappers on pointer types or switch to a higher level crate
     // than llvm-sys.
     pub fn load(
-        name: &str,
+        output_path: &str,
         code: &Bytes,
         symbol_prefix: &str,
         instruction_cycle_func: &InstructionCycleFunc,
         generate_debug_info: bool,
     ) -> Result<Self, Error> {
-        let name = Path::new(name)
+        let name = Path::new(output_path)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(name);
-        let directory = Path::new(name)
+            .unwrap_or(output_path);
+        let directory = Path::new(output_path)
             .parent()
             .and_then(|s| s.to_str())
             .unwrap_or(".");

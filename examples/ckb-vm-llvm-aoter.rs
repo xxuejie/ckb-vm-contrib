@@ -101,8 +101,9 @@ fn main() -> Result<(), Error> {
         }
         Generate::Bitcode => {
             let t0 = SystemTime::now();
+            let output = args.output.unwrap_or("a.bc".to_string());
             let machine = LlvmCompilingMachine::load(
-                &args.input,
+                &output,
                 &code,
                 &args.symbol_prefix,
                 &instruction_cycles,
@@ -114,7 +115,6 @@ fn main() -> Result<(), Error> {
                 let duration = t1.duration_since(t0).expect("time went backwards");
                 println!("Time to emit LLVM bitcode: {:?}", duration);
             }
-            let output = args.output.unwrap_or("a.bc".to_string());
             std::fs::write(&output, &bitcode)?;
         }
         Generate::Object => {
@@ -180,7 +180,7 @@ fn main() -> Result<(), Error> {
 fn build_object(code: &Bytes, args: &Args, output: &str) -> Result<(), Error> {
     let t0 = SystemTime::now();
     let machine = LlvmCompilingMachine::load(
-        &args.input,
+        output,
         &code,
         &args.symbol_prefix,
         &instruction_cycles,
