@@ -27,11 +27,11 @@ pub fn parse<R: Register>(input: &str) -> Result<Vec<TaggedInstruction>, Error> 
     let lines = input.trim().split('\n');
     for line in lines {
         let mut stream = InstrStream::create(line);
-        let opcode_name = stream.next_token()?;
-        if let Some((opcode, f)) = PARSER_FUNCS.get(opcode_name) {
+        let opcode_name = stream.next_token()?.to_lowercase();
+        if let Some((opcode, f)) = PARSER_FUNCS.get(&opcode_name.replace(".", "")) {
             let inst = f(*opcode, &mut stream)?;
             insts.push(inst);
-        } else if let Some(parsed_insts) = parse_pseudoinstructions::<R>(opcode_name, &mut stream)?
+        } else if let Some(parsed_insts) = parse_pseudoinstructions::<R>(&opcode_name, &mut stream)?
         {
             insts.extend(parsed_insts);
         } else {
@@ -103,19 +103,18 @@ lazy_static! {
     static ref PARSER_FUNCS: HashMap<String, (InstructionOpcode, ParserFunc)> = {
         let mut m = HashMap::new();
         // noarg types
-        m.insert("ecall".to_string(), (opcodes::OP_ECALL, parse_noarg_rtype as ParserFunc));
-        m.insert("ebreak".to_string(), (opcodes::OP_EBREAK, parse_noarg_rtype as ParserFunc));
-        m.insert("fencei".to_string(), (opcodes::OP_FENCEI, parse_noarg_rtype as ParserFunc));
+        for op in [opcodes::OP_ECALL, opcodes::OP_EBREAK, opcodes::OP_FENCEI] {
+            m.insert(instruction_opcode_name(op).to_lowercase().to_string(), (op, parse_noarg_rtype as ParserFunc));
+        }
         // B types
-        m.insert("beq".to_string(), (opcodes::OP_BEQ, parse_btype as ParserFunc));
-        m.insert("bne".to_string(), (opcodes::OP_BNE, parse_btype as ParserFunc));
-        m.insert("blt".to_string(), (opcodes::OP_BLT, parse_btype as ParserFunc));
-        m.insert("bge".to_string(), (opcodes::OP_BGE, parse_btype as ParserFunc));
-        m.insert("bltu".to_string(), (opcodes::OP_BLTU, parse_btype as ParserFunc));
-        m.insert("bgeu".to_string(), (opcodes::OP_BGEU, parse_btype as ParserFunc));
+        for op in [opcodes::OP_BEQ, opcodes::OP_BNE, opcodes::OP_BLT,
+            opcodes::OP_BGE, opcodes::OP_BLTU, opcodes::OP_BGEU]
+        {
+            m.insert(instruction_opcode_name(op).to_lowercase().to_string(), (op, parse_btype as ParserFunc));
+        }
 
         for op in opcodes::OP_UNLOADED..=opcodes::OP_CUSTOM_TRACE_END {
-            let name = instruction_opcode_name(op).to_lowercase();
+            let name = instruction_opcode_name(op).to_lowercase().to_string();
             if !m.contains_key(&name) {
                 let f = match TaggedInstruction::try_from(blank_instruction(op)) {
                     Ok(TaggedInstruction::Rtype(_)) => Some(parse_rtype as ParserFunc),
@@ -614,5 +613,23 @@ impl<'a> InstrStream<'a> {
         }
         self.current += 1;
         Ok(number)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ckb_vm_definitions::instructions::{self as opcodes, instruction_opcode_name};
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_all_opcode_names_are_unique() {
+        let mut count = 0;
+        let mut distinct_names: HashSet<&str> = HashSet::default();
+        for i in opcodes::OP_UNLOADED..=opcodes::OP_CUSTOM_TRACE_END {
+            count += 1;
+            distinct_names.insert(instruction_opcode_name(i));
+        }
+
+        assert_eq!(count, distinct_names.len());
     }
 }
