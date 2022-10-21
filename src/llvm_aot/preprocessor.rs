@@ -177,13 +177,15 @@ fn extract_funcs<M: Memory>(
 
     // Test there's no empty section
     if sections.iter().any(Range::is_empty) {
-        return Err(Error::AotSectionIsEmpty);
+        return Err(Error::External("An empty section is found!".to_string()));
     }
     // Test no section overlaps with one another. We first sort section
     // list by start, then we test if each end is equal or less than
     // the next start.
     if sections.windows(2).any(|w| w[0].end > w[1].start) {
-        return Err(Error::AotSectionOverlaps);
+        return Err(Error::External(
+            "A section overlaps with another one!".to_string(),
+        ));
     }
 
     let mut funcs: Vec<Func> = sections

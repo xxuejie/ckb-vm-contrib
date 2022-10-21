@@ -28,8 +28,8 @@ pub const EXIT_REASON_BARE_CALL_EXIT: u8 = 101;
 pub const EXIT_REASON_MAX_CYCLES_EXCEEDED: u8 = 102;
 pub const EXIT_REASON_CYCLES_OVERFLOW: u8 = 103;
 
-pub struct LlvmAotMachine {
-    pub machine: DefaultMachine<LlvmAotCoreMachine>,
+pub struct LlvmAotMachine<'a> {
+    pub machine: DefaultMachine<'a, LlvmAotCoreMachine<'a>>,
 
     pub code_hash: [u8; 32],
     // Mapping from RISC-V function entry to host function entry
@@ -41,8 +41,8 @@ pub struct LlvmAotMachine {
 }
 
 #[repr(C)]
-pub struct LlvmAotMachineEnv {
-    pub data: *mut LlvmAotMachine,
+pub struct LlvmAotMachineEnv<'a> {
+    pub data: *mut LlvmAotMachine<'a>,
     pub ecall: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub ebreak: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub query_function: unsafe extern "C" fn(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64,
@@ -115,7 +115,7 @@ fn inner_interpret(m: &mut LlvmAotMachine) -> Result<u64, Error> {
     Ok(0)
 }
 
-impl LlvmAotMachine {
+impl<'a> LlvmAotMachine<'a> {
     pub fn new(memory_size: usize, aot_symbols: &AotSymbols) -> Result<Self, Error> {
         let core_machine = LlvmAotCoreMachine::new(memory_size)?;
         let machine = DefaultMachineBuilder::new(core_machine).build();
@@ -123,7 +123,7 @@ impl LlvmAotMachine {
     }
 
     pub fn new_with_machine(
-        machine: DefaultMachine<LlvmAotCoreMachine>,
+        machine: DefaultMachine<'a, LlvmAotCoreMachine<'a>>,
         aot_symbols: &AotSymbols,
     ) -> Result<Self, Error> {
         if aot_symbols.code_hash.len() != 32 {
@@ -229,7 +229,7 @@ impl LlvmAotMachine {
         execute(instruction, &mut self.machine)
     }
 
-    fn env(&self) -> LlvmAotMachineEnv {
+    fn env<'b>(&self) -> LlvmAotMachineEnv<'b> {
         LlvmAotMachineEnv {
             data: self as *const LlvmAotMachine as *mut LlvmAotMachine,
             ecall: bare_ecall,
@@ -241,7 +241,7 @@ impl LlvmAotMachine {
 }
 
 #[repr(C)]
-pub struct LlvmAotCoreMachineData {
+pub struct LlvmAotCoreMachineData<'a> {
     pub pc: u64,
     pub memory: *mut u8,
     pub cycles: u64,
@@ -253,17 +253,17 @@ pub struct LlvmAotCoreMachineData {
     pub exit_aot_reason: u8,
     pub jmpbuf: [u64; 5],
 
-    pub env: *const LlvmAotMachineEnv,
+    pub env: *const LlvmAotMachineEnv<'a>,
 }
 
-pub struct LlvmAotCoreMachine {
-    pub data: LlvmAotCoreMachineData,
+pub struct LlvmAotCoreMachine<'a> {
+    pub data: LlvmAotCoreMachineData<'a>,
 
     pub allocation: Allocation,
     pub cached_region: Option<Region>,
 }
 
-impl LlvmAotCoreMachine {
+impl<'a> LlvmAotCoreMachine<'a> {
     pub fn new(memory_size: usize) -> Result<Self, Error> {
         if memory_size % RISCV_PAGESIZE != 0 {
             return Err(Error::External(
@@ -326,7 +326,7 @@ impl LlvmAotCoreMachine {
     }
 }
 
-impl CoreMachine for LlvmAotCoreMachine {
+impl<'a> CoreMachine for LlvmAotCoreMachine<'a> {
     type REG = u64;
     type MEM = Self;
 
@@ -367,7 +367,7 @@ impl CoreMachine for LlvmAotCoreMachine {
     }
 }
 
-impl SupportMachine for LlvmAotCoreMachine {
+impl<'a> SupportMachine for LlvmAotCoreMachine<'a> {
     fn cycles(&self) -> u64 {
         self.data.cycles
     }
@@ -399,7 +399,7 @@ impl SupportMachine for LlvmAotCoreMachine {
     }
 }
 
-impl Memory for LlvmAotCoreMachine {
+impl<'a> Memory for LlvmAotCoreMachine<'a> {
     type REG = u64;
 
     fn init_pages(
