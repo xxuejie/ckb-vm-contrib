@@ -1,10 +1,10 @@
 use super::{AOT_ISA, AOT_VERSION};
 use ckb_vm::{
+    ckb_vm_definitions::registers::REGISTER_ABI_NAMES,
     instructions::ast::{ActionOp2, Value},
     registers::RA,
     Bytes, CoreMachine, Error, Machine, Memory, Register,
 };
-use ckb_vm_definitions::registers::REGISTER_ABI_NAMES;
 use std::collections::HashMap;
 use std::fmt;
 use std::mem;

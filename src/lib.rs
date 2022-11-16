@@ -7,4 +7,4 @@ pub mod printer;
 pub mod syscalls;
 
 pub use ckb_vm;
-pub use ckb_vm_definitions;
+pub use ckb_vm::ckb_vm_definitions;

@@ -1,9 +1,9 @@
 use super::utils::*;
 use ckb_vm::{
+    ckb_vm_definitions::instructions as opcodes,
     instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype, Utype},
     Register,
 };
-use ckb_vm_definitions::instructions as opcodes;
 
 pub fn assembler<R: Register>(inst: &TaggedInstruction) -> Option<Vec<u8>> {
     match inst {

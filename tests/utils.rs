@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
 use ckb_vm::{
+    ckb_vm_definitions::instructions as opcodes,
     instructions::{tagged::TaggedInstruction, Instruction, InstructionOpcode},
     Bytes, Error, Memory, Register, RISCV_PAGESIZE,
 };
-use ckb_vm_definitions::instructions as opcodes;
 use proptest::prelude::*;
 use std::marker::PhantomData;
 

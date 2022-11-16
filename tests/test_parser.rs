@@ -1,11 +1,13 @@
 mod utils;
 
-use ckb_vm::instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype, Utype};
+use ckb_vm::{
+    ckb_vm_definitions::instructions as opcodes,
+    instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype, Utype},
+};
 use ckb_vm_contrib::{
     assembler::{assemble, parse},
     printer::InstructionPrinter,
 };
-use ckb_vm_definitions::instructions as opcodes;
 use proptest::prelude::*;
 use utils::*;
 

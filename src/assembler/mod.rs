@@ -5,14 +5,14 @@ pub mod rvc;
 mod utils;
 
 use ckb_vm::{
+    ckb_vm_definitions::{
+        instructions::{self as opcodes, instruction_opcode_name, InstructionOpcode},
+        registers::REGISTER_ABI_NAMES,
+    },
     instructions::{
         blank_instruction, tagged::TaggedInstruction, Itype, RegisterIndex, Rtype, Stype, Utype,
     },
     Error, Register,
-};
-use ckb_vm_definitions::{
-    instructions::{self as opcodes, instruction_opcode_name, InstructionOpcode},
-    registers::REGISTER_ABI_NAMES,
 };
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -618,7 +618,7 @@ impl<'a> InstrStream<'a> {
 
 #[cfg(test)]
 mod tests {
-    use ckb_vm_definitions::instructions::{self as opcodes, instruction_opcode_name};
+    use ckb_vm::ckb_vm_definitions::instructions::{self as opcodes, instruction_opcode_name};
     use std::collections::HashSet;
 
     #[test]

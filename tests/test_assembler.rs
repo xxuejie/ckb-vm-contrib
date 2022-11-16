@@ -1,13 +1,13 @@
 mod utils;
 
 use ckb_vm::{
+    ckb_vm_definitions::instructions as opcodes,
     decoder::build_decoder,
     instructions::{tagged::TaggedInstruction, Itype, Rtype, Stype, Utype},
     machine::VERSION1,
     ISA_IMC,
 };
 use ckb_vm_contrib::assembler::{assemble, i, m, Assembler};
-use ckb_vm_definitions::instructions as opcodes;
 use proptest::prelude::*;
 use utils::*;
 

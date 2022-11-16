@@ -3,13 +3,13 @@ use super::{
     AOT_ISA, AOT_VERSION,
 };
 use ckb_vm::{
+    ckb_vm_definitions::{RISCV_GENERAL_REGISTER_NUMBER, RISCV_PAGESIZE},
     decoder::{build_decoder, Decoder},
     instructions::{execute, is_basic_block_end_instruction},
     machine::{DefaultMachine, DefaultMachineBuilder},
     memory::{fill_page_data, memset, round_page_down, round_page_up, FLAG_EXECUTABLE},
     Bytes, CoreMachine, Error, Machine, Memory, SupportMachine,
 };
-use ckb_vm_definitions::{RISCV_GENERAL_REGISTER_NUMBER, RISCV_PAGESIZE};
 use region::{self, alloc, query_range, Allocation, Protection, Region};
 use std::collections::HashMap;
 use std::ptr;
@@ -28,8 +28,8 @@ pub const EXIT_REASON_BARE_CALL_EXIT: u8 = 101;
 pub const EXIT_REASON_MAX_CYCLES_EXCEEDED: u8 = 102;
 pub const EXIT_REASON_CYCLES_OVERFLOW: u8 = 103;
 
-pub struct LlvmAotMachine<'a> {
-    pub machine: DefaultMachine<'a, LlvmAotCoreMachine<'a>>,
+pub struct LlvmAotMachine {
+    pub machine: DefaultMachine<LlvmAotCoreMachine>,
 
     pub code_hash: [u8; 32],
     // Mapping from RISC-V function entry to host function entry
@@ -41,8 +41,8 @@ pub struct LlvmAotMachine<'a> {
 }
 
 #[repr(C)]
-pub struct LlvmAotMachineEnv<'a> {
-    pub data: *mut LlvmAotMachine<'a>,
+pub struct LlvmAotMachineEnv {
+    pub data: *mut LlvmAotMachine,
     pub ecall: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub ebreak: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub query_function: unsafe extern "C" fn(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64,
@@ -115,7 +115,7 @@ fn inner_interpret(m: &mut LlvmAotMachine) -> Result<u64, Error> {
     Ok(0)
 }
 
-impl<'a> LlvmAotMachine<'a> {
+impl LlvmAotMachine {
     pub fn new(memory_size: usize, aot_symbols: &AotSymbols) -> Result<Self, Error> {
         let core_machine = LlvmAotCoreMachine::new(memory_size)?;
         let machine = DefaultMachineBuilder::new(core_machine).build();
@@ -123,7 +123,7 @@ impl<'a> LlvmAotMachine<'a> {
     }
 
     pub fn new_with_machine(
-        machine: DefaultMachine<'a, LlvmAotCoreMachine<'a>>,
+        machine: DefaultMachine<LlvmAotCoreMachine>,
         aot_symbols: &AotSymbols,
     ) -> Result<Self, Error> {
         if aot_symbols.code_hash.len() != 32 {
@@ -229,7 +229,7 @@ impl<'a> LlvmAotMachine<'a> {
         execute(instruction, &mut self.machine)
     }
 
-    fn env<'b>(&self) -> LlvmAotMachineEnv<'b> {
+    fn env(&self) -> LlvmAotMachineEnv {
         LlvmAotMachineEnv {
             data: self as *const LlvmAotMachine as *mut LlvmAotMachine,
             ecall: bare_ecall,
@@ -241,7 +241,7 @@ impl<'a> LlvmAotMachine<'a> {
 }
 
 #[repr(C)]
-pub struct LlvmAotCoreMachineData<'a> {
+pub struct LlvmAotCoreMachineData {
     pub pc: u64,
     pub memory: *mut u8,
     pub cycles: u64,
@@ -253,17 +253,17 @@ pub struct LlvmAotCoreMachineData<'a> {
     pub exit_aot_reason: u8,
     pub jmpbuf: [u64; 5],
 
-    pub env: *const LlvmAotMachineEnv<'a>,
+    pub env: *const LlvmAotMachineEnv,
 }
 
-pub struct LlvmAotCoreMachine<'a> {
-    pub data: LlvmAotCoreMachineData<'a>,
+pub struct LlvmAotCoreMachine {
+    pub data: LlvmAotCoreMachineData,
 
     pub allocation: Allocation,
     pub cached_region: Option<Region>,
 }
 
-impl<'a> LlvmAotCoreMachine<'a> {
+impl LlvmAotCoreMachine {
     pub fn new(memory_size: usize) -> Result<Self, Error> {
         if memory_size % RISCV_PAGESIZE != 0 {
             return Err(Error::External(
@@ -326,7 +326,7 @@ impl<'a> LlvmAotCoreMachine<'a> {
     }
 }
 
-impl<'a> CoreMachine for LlvmAotCoreMachine<'a> {
+impl CoreMachine for LlvmAotCoreMachine {
     type REG = u64;
     type MEM = Self;
 
@@ -367,7 +367,7 @@ impl<'a> CoreMachine for LlvmAotCoreMachine<'a> {
     }
 }
 
-impl<'a> SupportMachine for LlvmAotCoreMachine<'a> {
+impl SupportMachine for LlvmAotCoreMachine {
     fn cycles(&self) -> u64 {
         self.data.cycles
     }
@@ -399,7 +399,7 @@ impl<'a> SupportMachine for LlvmAotCoreMachine<'a> {
     }
 }
 
-impl<'a> Memory for LlvmAotCoreMachine<'a> {
+impl Memory for LlvmAotCoreMachine {
     type REG = u64;
 
     fn init_pages(

@@ -1,11 +1,11 @@
 use ckb_vm::{
+    ckb_vm_definitions::instructions as insts,
     decoder::Decoder,
     instructions::{
         extract_opcode, instruction_length, set_instruction_length_n, Instruction, Itype, Utype,
     },
     Error, Memory,
 };
-use ckb_vm_definitions::instructions as insts;
 
 /// This wraps on top of ckb-vm's decoder, providing more mops & opcode
 /// rewriting that can further optimize the VM.

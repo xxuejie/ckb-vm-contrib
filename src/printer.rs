@@ -1,7 +1,9 @@
-use ckb_vm::instructions::{
-    extract_opcode, tagged::TaggedInstruction, Instruction, InstructionOpcode, Utype,
+use ckb_vm::{
+    ckb_vm_definitions::{instructions as opcodes, registers::REGISTER_ABI_NAMES},
+    instructions::{
+        extract_opcode, tagged::TaggedInstruction, Instruction, InstructionOpcode, Utype,
+    },
 };
-use ckb_vm_definitions::{instructions as opcodes, registers::REGISTER_ABI_NAMES};
 use core::fmt;
 
 #[derive(Clone, Debug, PartialEq)]

@@ -143,7 +143,7 @@ fn main() -> Result<(), Error> {
             let aot_symbols = &dl_symbols.aot_symbols;
             let core_machine =
                 DefaultMachineBuilder::new(LlvmAotCoreMachine::new(args.memory_size)?)
-                    .instruction_cycle_func(&instruction_cycles)
+                    .instruction_cycle_func(Box::new(instruction_cycles))
                     .syscall(Box::new(DebugSyscall {}))
                     .syscall(Box::new(TimeSyscall::new()))
                     .build();

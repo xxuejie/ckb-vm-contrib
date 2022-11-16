@@ -12,11 +12,11 @@ use super::{
     utils::cs,
 };
 use ckb_vm::{
+    ckb_vm_definitions::registers,
     instructions::ast::{ActionOp1, ActionOp2, SignActionOp2, Value},
     machine::InstructionCycleFunc,
     Bytes, Error, Register,
 };
-use ckb_vm_definitions::registers;
 use lazy_static::lazy_static;
 use llvm_sys::{
     analysis::*,
