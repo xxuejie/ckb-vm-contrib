@@ -1729,7 +1729,6 @@ fn emit_value<'a>(
                 }
                 ActionOp2::Rol => {
                     let t = machine_word_type(context)?;
-                    let args_type = [t.into(); 3];
 
                     let intrinsic = match Intrinsic::find("llvm.fshl.*") {
                         Some(i) => i,
@@ -1737,11 +1736,13 @@ fn emit_value<'a>(
                             return Err(Error::External("Missing intrinsic for fshl!".to_string()))
                         }
                     };
+                    // Even though the intrinsic actually takes 3 arguments, we are only using the
+                    // first one here to locate overloaded intrinsic, which has only one placeholder
                     let intrinsic_func = intrinsic
-                        .get_declaration(&emit_data.module, &args_type)
+                        .get_declaration(&emit_data.module, &[t.into(); 1])
                         .ok_or_else(|| {
-                        Error::External("Unable to get declaration for fshl!".to_string())
-                    })?;
+                            Error::External("Unable to get declaration for fshl!".to_string())
+                        })?;
 
                     let args = [lhs.into(), lhs.into(), rhs.into()];
                     emit_data
@@ -1753,7 +1754,6 @@ fn emit_value<'a>(
                 }
                 ActionOp2::Ror => {
                     let t = machine_word_type(context)?;
-                    let args_type = [t.into(); 3];
 
                     let intrinsic = match Intrinsic::find("llvm.fshr.*") {
                         Some(i) => i,
@@ -1762,10 +1762,10 @@ fn emit_value<'a>(
                         }
                     };
                     let intrinsic_func = intrinsic
-                        .get_declaration(&emit_data.module, &args_type)
+                        .get_declaration(&emit_data.module, &[t.into(); 1])
                         .ok_or_else(|| {
-                        Error::External("Unable to get declaration for fshr!".to_string())
-                    })?;
+                            Error::External("Unable to get declaration for fshr!".to_string())
+                        })?;
 
                     let args = [lhs.into(), lhs.into(), rhs.into()];
                     emit_data
