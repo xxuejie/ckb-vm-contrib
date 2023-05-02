@@ -30,6 +30,12 @@ enum Generate {
     RunResult,
 }
 
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
+enum OptimizeLevel {
+    Default,
+    None,
+}
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "A simple runner for ckb-vm's LLVM AOT engine", long_about = None)]
 struct Args {
@@ -38,8 +44,8 @@ struct Args {
     time: bool,
 
     /// Optimize the generated code
-    #[clap(long, default_value = "true")]
-    optimize: bool,
+    #[clap(long, default_value = "default")]
+    optimize_level: OptimizeLevel,
 
     /// Generate debug information
     #[clap(short, long)]
@@ -78,6 +84,12 @@ struct Args {
     run_args: Vec<String>,
 }
 
+impl Args {
+    fn optimized(&self) -> bool {
+        self.optimize_level == OptimizeLevel::Default
+    }
+}
+
 fn main() -> Result<(), Error> {
     flexi_logger::Logger::try_with_env()
         .unwrap()
@@ -104,7 +116,7 @@ fn main() -> Result<(), Error> {
         }
         Generate::Bitcode => {
             let t0 = SystemTime::now();
-            let output = args.output.unwrap_or("a.bc".to_string());
+            let output = args.output.clone().unwrap_or("a.bc".to_string());
             let machine = LlvmCompilingMachine::load(
                 &output,
                 &code,
@@ -112,7 +124,7 @@ fn main() -> Result<(), Error> {
                 &instruction_cycles,
                 args.debug_info,
             )?;
-            let bitcode = machine.bitcode(args.optimize)?;
+            let bitcode = machine.bitcode(args.optimized())?;
             if args.time {
                 let t1 = SystemTime::now();
                 let duration = t1.duration_since(t0).expect("time went backwards");
@@ -189,7 +201,7 @@ fn build_object(code: &Bytes, args: &Args, output: &str) -> Result<(), Error> {
         &instruction_cycles,
         args.debug_info,
     )?;
-    let object = machine.aot(args.optimize)?;
+    let object = machine.aot(args.optimized())?;
     if args.time {
         let t1 = SystemTime::now();
         let duration = t1.duration_since(t0).expect("time went backwards");

@@ -1,6 +1,6 @@
 pub mod ast;
 mod compiler;
-mod macros;
+mod emitter;
 mod preprocessor;
 mod runner;
 mod symbols;
