@@ -41,7 +41,7 @@ paste = { version = "1.0", optional = true }
 [dev-dependencies]
 proptest = "1.0.0"
 flexi_logger = "0.23.0"
-clap = { version = "3.2.20", features = ["derive"] }
+clap = { version = "4.2.5", features = ["derive"] }
 tempfile = "3.3.0"
 which = "4.3.0"
 
