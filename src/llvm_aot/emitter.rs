@@ -1333,7 +1333,7 @@ fn emit_value<'a>(
                 ActionOp1::Not => emit_data
                     .builder
                     .build_not(val, &format!("{}_nottemp", force_name)),
-                ActionOp1::LogicalNot => emit_data.builder.build_int_add(
+                ActionOp1::LogicalNot => emit_data.builder.build_and(
                     i64t.const_int(1, false),
                     emit_data
                         .builder
