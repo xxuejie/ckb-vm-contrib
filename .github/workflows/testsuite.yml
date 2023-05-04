@@ -12,15 +12,15 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
     - uses: actions/checkout@v3
-    - name: Install riscv toolchain
-      run: sudo docker run --rm -v `pwd`:/code nervos/ckb-riscv-gnu-toolchain:bionic-20211214 cp -r /riscv /code/riscv
-    - name: Install llvm 14
-      run: wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 15 all
+    - name: Install ckb contract toolchain
+      run: curl -f https://raw.githubusercontent.com/xxuejie/ckb-contract-toolchains/main/install.sh | bash
+    - name: Install llvm 15
+      run: wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 15
     - name: Clone test suite
-      run: git clone https://github.com/xxuejie/ckb-vm-contrib-test-suite && cd ckb-vm-contrib-test-suite && git checkout 8fc582fd8f31827f16df0ea484583a62bfd4298f && git submodule update --init --recursive
+      run: git clone https://github.com/xxuejie/ckb-vm-contrib-test-suite && cd ckb-vm-contrib-test-suite && git checkout 56c78eb9fb97d3d284efb50fed92fa30063656b2 && git submodule update --init --recursive
     - name: Run test suite
-      run: cd ckb-vm-contrib-test-suite && ln -s .. ckb-vm-contrib && RISCV=`pwd`/../riscv ./test.sh
+      run: cd ckb-vm-contrib-test-suite && ln -s .. ckb-vm-contrib && ./test.sh
