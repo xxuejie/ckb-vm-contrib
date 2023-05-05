@@ -11,6 +11,7 @@ use ckb_vm_contrib::{
     syscalls::{DebugSyscall, TimeSyscall},
 };
 use clap::{Parser, ValueEnum};
+use lld_rs::{LldFlavor, link};
 use log::info;
 use std::fs::File;
 use std::io::{self, Write};
@@ -212,21 +213,12 @@ fn build_object(code: &Bytes, args: &Args, output: &str) -> Result<(), Error> {
 }
 
 fn build_shared_library(input: &str, output: &str) -> Result<(), Error> {
-    let mut cmd = Command::new(find_linker());
-    cmd.arg("-shared").arg("-o").arg(output).arg(input);
-    let output = cmd
-        .output()
-        .map_err(|e| Error::External(format!("Executing error: {:?}", e)))?;
-    if !output.status.success() {
-        return Err(Error::External(format!(
-            "Error executing gcc: {:?}, stdout: {}, stderr: {}",
-            output.status.code(),
-            std::str::from_utf8(&output.stdout).unwrap_or("non UTF-8 data"),
-            std::str::from_utf8(&output.stderr).unwrap_or("non UTF-8 data"),
-        )));
-    }
-
-    Ok(())
+    link(LldFlavor::Elf, &[
+        "-shared".to_string(),
+        "-o".to_string(),
+        output.to_string(),
+        input.to_string(),
+    ]).ok().map_err(Error::External)
 }
 
 fn dump_funcs(mut o: Box<dyn Write>, funcs: &[Func]) -> Result<(), Error> {
