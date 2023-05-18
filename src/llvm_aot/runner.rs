@@ -194,7 +194,7 @@ impl LlvmAotMachine {
                 let result = {
                     // Clear previous last_ra value, which should now be invalid.
                     // TODO: check this again when we are doing nested stacks
-                    self.machine.inner_mut().data.last_ra = 0;
+                    self.machine.inner_mut().data.last_ra = BARE_FUNC_ERROR_OR_TERMINATED;
                     let env = self.env();
                     self.machine.inner_mut().data.env = &env;
                     unsafe {
