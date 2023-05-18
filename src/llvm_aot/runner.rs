@@ -237,6 +237,14 @@ impl LlvmAotMachine {
     pub fn step(&mut self) -> Result<Instruction, Error> {
         let pc = *self.machine.pc();
         let instruction = self.decoder.decode(self.machine.memory_mut(), pc)?;
+        let cycles = self.machine.instruction_cycle_func()(instruction);
+        #[cfg(feature = "probes")]
+        {
+            use probe::probe;
+
+            probe!(ckb_vm_contrib, llvm_aot_step, pc, instruction, cycles);
+        }
+        self.machine.add_cycles(cycles)?;
         execute(instruction, &mut self.machine)?;
         Ok(instruction)
     }
