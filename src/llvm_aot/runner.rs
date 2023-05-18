@@ -205,12 +205,9 @@ impl LlvmAotMachine {
                     return Err(e.clone());
                 }
                 match result {
-                    EXIT_REASON_MALFORMED_RETURN => {
-                        // TODO: Revert to interpreter stack here.
-                        return Err(Error::External(format!(
-                            "Machine encountered a malformed return!",
-                        )));
-                    }
+                    // At this stage, we are already back at Rust interpreter stack, no further
+                    // action is required for OSR.
+                    EXIT_REASON_MALFORMED_RETURN => (),
                     EXIT_REASON_BARE_CALL_EXIT => {
                         if self.machine.running() {
                             return Err(Error::External(
