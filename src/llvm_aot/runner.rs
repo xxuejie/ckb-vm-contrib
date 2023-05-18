@@ -5,9 +5,12 @@ use super::{
 use ckb_vm::{
     ckb_vm_definitions::{RISCV_GENERAL_REGISTER_NUMBER, RISCV_PAGESIZE},
     decoder::{build_decoder, Decoder},
-    instructions::{execute, is_basic_block_end_instruction},
+    instructions::{
+        execute, extract_opcode, insts, is_basic_block_end_instruction, Instruction, Itype,
+    },
     machine::{DefaultMachine, DefaultMachineBuilder},
     memory::{fill_page_data, memset, round_page_down, round_page_up, FLAG_EXECUTABLE},
+    registers::{RA, ZERO},
     Bytes, CoreMachine, Error, Machine, Memory, SupportMachine,
 };
 use region::{self, alloc, query_range, Allocation, Protection, Region};
@@ -17,16 +20,14 @@ use std::slice::from_raw_parts_mut;
 
 const RUNTIME_FLAG_RUNNING: u8 = 1;
 
-pub const EXIT_REASON_ECALL_UNREACHABLE: u8 = 1;
-pub const EXIT_REASON_EBREAK_UNREACHABLE: u8 = 2;
-pub const EXIT_REASON_UNKNOWN_BLOCK: u8 = 3;
-pub const EXIT_REASON_UNKNOWN_PC_VALUE: u8 = 4;
-pub const EXIT_REASON_UNKNOWN_RESUME_ADDRESS: u8 = 5;
-pub const EXIT_REASON_MALFORMED_RETURN: u8 = 6;
-pub const EXIT_REASON_MALFORMED_INDIRECT_CALL: u8 = 7;
-pub const EXIT_REASON_BARE_CALL_EXIT: u8 = 101;
+pub const EXIT_REASON_MALFORMED_RETURN: u8 = 101;
 pub const EXIT_REASON_MAX_CYCLES_EXCEEDED: u8 = 102;
 pub const EXIT_REASON_CYCLES_OVERFLOW: u8 = 103;
+pub const EXIT_REASON_BARE_CALL_EXIT: u8 = 104;
+
+pub const BARE_FUNC_ERROR_OR_TERMINATED: u64 = u64::MAX;
+pub const BARE_FUNC_RETURN: u64 = u64::MAX - 1;
+pub const BARE_FUNC_MISSING: u64 = u64::MAX - 2;
 
 pub struct LlvmAotMachine {
     pub machine: DefaultMachine<LlvmAotCoreMachine>,
@@ -46,7 +47,7 @@ pub struct LlvmAotMachineEnv {
     pub ecall: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub ebreak: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub query_function: unsafe extern "C" fn(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64,
-    pub interpret: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
+    pub interpret: unsafe extern "C" fn(m: *mut LlvmAotMachine, return_on_call: u64) -> u64,
 }
 
 unsafe extern "C" fn bare_ecall(m: *mut LlvmAotMachine) -> u64 {
@@ -56,12 +57,12 @@ unsafe extern "C" fn bare_ecall(m: *mut LlvmAotMachine) -> u64 {
             if m.machine.running() {
                 1
             } else {
-                0
+                BARE_FUNC_ERROR_OR_TERMINATED
             }
         }
         Err(e) => {
             m.bare_call_error = Some(e);
-            0
+            BARE_FUNC_ERROR_OR_TERMINATED
         }
     }
 }
@@ -73,12 +74,12 @@ unsafe extern "C" fn bare_ebreak(m: *mut LlvmAotMachine) -> u64 {
             if m.machine.running() {
                 1
             } else {
-                0
+                BARE_FUNC_ERROR_OR_TERMINATED
             }
         }
         Err(e) => {
             m.bare_call_error = Some(e);
-            0
+            BARE_FUNC_ERROR_OR_TERMINATED
         }
     }
 }
@@ -87,32 +88,49 @@ unsafe extern "C" fn bare_query_function(m: *mut LlvmAotMachine, riscv_addr: u64
     let m = &*m;
     *m.function_mapping
         .get(&riscv_addr)
-        .unwrap_or(&u64::max_value())
+        .unwrap_or(&BARE_FUNC_MISSING)
 }
 
-unsafe extern "C" fn bare_interpret(m: *mut LlvmAotMachine) -> u64 {
+unsafe extern "C" fn bare_interpret(m: *mut LlvmAotMachine, return_on_call: u64) -> u64 {
     let mut m = &mut *m;
-    match inner_interpret(&mut m) {
+    match inner_interpret(&mut m, return_on_call != 0) {
         Ok(block_end) => block_end,
         Err(e) => {
             m.bare_call_error = Some(e);
-            0
+            BARE_FUNC_ERROR_OR_TERMINATED
         }
     }
 }
 
-fn inner_interpret(m: &mut LlvmAotMachine) -> Result<u64, Error> {
-    while m.machine.running() {
-        let pc = *m.machine.pc();
-        let instruction = m.decoder.decode(m.machine.memory_mut(), pc)?;
-        execute(instruction, &mut m.machine)?;
+fn inner_interpret(m: &mut LlvmAotMachine, return_on_call: bool) -> Result<u64, Error> {
+    let f = if return_on_call {
+        is_ret_instruction
+    } else {
+        is_basic_block_end_instruction
+    };
 
-        if is_basic_block_end_instruction(instruction) {
-            return Ok(*m.machine.pc());
+    while m.machine.running() {
+        let instruction = m.step()?;
+
+        if f(instruction) {
+            if is_ret_instruction(instruction) {
+                return Ok(BARE_FUNC_RETURN);
+            } else {
+                return Ok(*m.machine.pc());
+            }
         }
     }
     // Terminating
-    Ok(0)
+    Ok(BARE_FUNC_ERROR_OR_TERMINATED)
+}
+
+fn is_ret_instruction(i: Instruction) -> bool {
+    let opcode = extract_opcode(i);
+    if opcode != insts::OP_JALR {
+        return false;
+    }
+    let i = Itype(i);
+    i.rd() == ZERO && i.rs1() == RA && i.immediate_u() == 0
 }
 
 impl LlvmAotMachine {
@@ -168,13 +186,14 @@ impl LlvmAotMachine {
         self.machine.load_program(program, args)
     }
 
-    pub fn run(&mut self, fast_mode: bool) -> Result<i8, Error> {
+    pub fn run(&mut self) -> Result<i8, Error> {
         self.machine.set_running(true);
         while self.machine.running() {
             let pc = *self.machine.pc();
             if let Some(host_function) = self.function_mapping.get(&pc) {
                 let result = {
                     // Clear previous last_ra value, which should now be invalid.
+                    // TODO: check this again when we are doing nested stacks
                     self.machine.inner_mut().data.last_ra = 0;
                     let env = self.env();
                     self.machine.inner_mut().data.env = &env;
@@ -186,19 +205,11 @@ impl LlvmAotMachine {
                     return Err(e.clone());
                 }
                 match result {
-                    EXIT_REASON_ECALL_UNREACHABLE
-                    | EXIT_REASON_EBREAK_UNREACHABLE
-                    | EXIT_REASON_UNKNOWN_BLOCK
-                    | EXIT_REASON_UNKNOWN_PC_VALUE
-                    | EXIT_REASON_UNKNOWN_RESUME_ADDRESS
-                    | EXIT_REASON_MALFORMED_RETURN
-                    | EXIT_REASON_MALFORMED_INDIRECT_CALL => {
-                        if fast_mode && self.machine.running() {
-                            return Err(Error::External(format!(
-                                "Fast mode exit with: {}",
-                                result
-                            )));
-                        }
+                    EXIT_REASON_MALFORMED_RETURN => {
+                        // TODO: Revert to interpreter stack here.
+                        return Err(Error::External(format!(
+                            "Machine encountered a malformed return!",
+                        )));
                     }
                     EXIT_REASON_BARE_CALL_EXIT => {
                         if self.machine.running() {
@@ -223,10 +234,11 @@ impl LlvmAotMachine {
         Ok(self.machine.exit_code())
     }
 
-    pub fn step(&mut self) -> Result<(), Error> {
+    pub fn step(&mut self) -> Result<Instruction, Error> {
         let pc = *self.machine.pc();
         let instruction = self.decoder.decode(self.machine.memory_mut(), pc)?;
-        execute(instruction, &mut self.machine)
+        execute(instruction, &mut self.machine)?;
+        Ok(instruction)
     }
 
     fn env(&self) -> LlvmAotMachineEnv {
