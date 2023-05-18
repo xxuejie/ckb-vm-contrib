@@ -189,7 +189,8 @@ pub struct EmittingFunc<'a> {
     allocas: RegAllocas<'a>,
     pc_alloca: PointerValue<'a>,
     memory_start: IntValue<'a>,
-    indirect_dispatcher: Option<(BasicBlock<'a>, PointerValue<'a>)>,
+    indirect_dispatcher_alloca: PointerValue<'a>,
+    indirect_dispatcher: Option<BasicBlock<'a>>,
     ret_block: Option<BasicBlock<'a>>,
 }
 
@@ -200,8 +201,10 @@ impl<'a> EmittingFunc<'a> {
         emit_data: &EmitData<'a>,
         next_pc: IntValue<'a>,
     ) -> Result<(), Error> {
-        let (block, alloca) = self.fetch_indirect_dispatcher(context, emit_data)?;
-        emit_data.builder.build_store(alloca, next_pc);
+        let block = self.fetch_indirect_dispatcher(context, emit_data)?;
+        emit_data
+            .builder
+            .build_store(self.indirect_dispatcher_alloca, next_pc);
         emit_data.builder.build_unconditional_branch(block);
         Ok(())
     }
@@ -213,25 +216,23 @@ impl<'a> EmittingFunc<'a> {
         &mut self,
         context: &'a Context,
         emit_data: &EmitData<'a>,
-    ) -> Result<(BasicBlock<'a>, PointerValue<'a>), Error> {
+    ) -> Result<BasicBlock<'a>, Error> {
         if let Some(result) = self.indirect_dispatcher {
             return Ok(result);
         }
 
         let i64t = context.i64_type();
-        let test_value_alloca = emit_data
-            .builder
-            .build_alloca(i64t, "indirect_dispatch_test_alloca");
 
         let current_block = emit_data.builder.get_insert_block().unwrap();
 
         let dispatch_block = context.append_basic_block(self.value, "indirect_dispatch_block");
         emit_data.builder.position_at_end(dispatch_block);
 
-        let test_value =
-            emit_data
-                .builder
-                .build_load(i64t, test_value_alloca, "indirect_dispatch_test_value");
+        let test_value = emit_data.builder.build_load(
+            i64t,
+            self.indirect_dispatcher_alloca,
+            "indirect_dispatch_test_value",
+        );
 
         let failure_block = context.append_basic_block(self.value, "indirect_jump_failure_block");
 
@@ -300,14 +301,14 @@ impl<'a> EmittingFunc<'a> {
         emit_data.builder.position_at_end(resume_block);
         emit_data
             .builder
-            .build_store(test_value_alloca, interpret_result);
+            .build_store(self.indirect_dispatcher_alloca, interpret_result);
         emit_data.builder.build_unconditional_branch(dispatch_block);
 
         emit_data.builder.position_at_end(current_block);
 
-        self.indirect_dispatcher = Some((dispatch_block, test_value_alloca));
+        self.indirect_dispatcher = Some(dispatch_block);
 
-        Ok((dispatch_block, test_value_alloca))
+        Ok(dispatch_block)
     }
 
     pub fn fetch_ret_block(
@@ -2463,6 +2464,10 @@ fn emit_riscv_func<'a>(
             Some("memory_start"),
         )?;
 
+        let indirect_dispatcher_alloca = emit_data
+            .builder
+            .build_alloca(i64t, "indirect_dispatch_test_alloca");
+
         EmittingFunc {
             basic_blocks,
             value: function,
@@ -2470,6 +2475,7 @@ fn emit_riscv_func<'a>(
             allocas: vars,
             pc_alloca,
             memory_start,
+            indirect_dispatcher_alloca,
             indirect_dispatcher: None,
             ret_block: None,
         }
