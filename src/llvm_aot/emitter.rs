@@ -2,11 +2,9 @@ use super::{
     ast::{register_names, Control, Write},
     preprocessor::{preprocess, Func},
     runner::{
-        LlvmAotCoreMachineData, LlvmAotMachineEnv, EXIT_REASON_BARE_CALL_EXIT,
-        EXIT_REASON_CYCLES_OVERFLOW, EXIT_REASON_EBREAK_UNREACHABLE, EXIT_REASON_ECALL_UNREACHABLE,
-        EXIT_REASON_MALFORMED_INDIRECT_CALL, EXIT_REASON_MALFORMED_RETURN,
-        EXIT_REASON_MAX_CYCLES_EXCEEDED, EXIT_REASON_UNKNOWN_BLOCK, EXIT_REASON_UNKNOWN_PC_VALUE,
-        EXIT_REASON_UNKNOWN_RESUME_ADDRESS,
+        LlvmAotCoreMachineData, LlvmAotMachineEnv, BARE_FUNC_ERROR_OR_TERMINATED,
+        BARE_FUNC_MISSING, BARE_FUNC_RETURN, EXIT_REASON_BARE_CALL_EXIT,
+        EXIT_REASON_CYCLES_OVERFLOW, EXIT_REASON_MALFORMED_RETURN, EXIT_REASON_MAX_CYCLES_EXCEEDED,
     },
 };
 use ckb_vm::{
@@ -181,6 +179,190 @@ impl<'a> DebugData<'a> {
 
     fn set_scope(&mut self, scope: DIScope<'a>) {
         self.current_scope = scope;
+    }
+}
+
+pub struct EmittingFunc<'a> {
+    basic_blocks: HashMap<u64, BasicBlock<'a>>,
+    value: FunctionValue<'a>,
+    machine: IntValue<'a>,
+    allocas: RegAllocas<'a>,
+    pc_alloca: PointerValue<'a>,
+    memory_start: IntValue<'a>,
+    indirect_dispatcher: Option<(BasicBlock<'a>, PointerValue<'a>)>,
+    ret_block: Option<BasicBlock<'a>>,
+}
+
+impl<'a> EmittingFunc<'a> {
+    pub fn emit_arbitrary_jump(
+        &mut self,
+        context: &'a Context,
+        emit_data: &EmitData<'a>,
+        next_pc: IntValue<'a>,
+    ) -> Result<(), Error> {
+        let (block, alloca) = self.fetch_indirect_dispatcher(context, emit_data)?;
+        emit_data.builder.build_store(alloca, next_pc);
+        emit_data.builder.build_unconditional_branch(block);
+        Ok(())
+    }
+
+    // In case a function contains indirect dispatches, we will emit a special
+    // basic block used to locate the correct basic block after the indirect
+    // dispatch.
+    pub fn fetch_indirect_dispatcher(
+        &mut self,
+        context: &'a Context,
+        emit_data: &EmitData<'a>,
+    ) -> Result<(BasicBlock<'a>, PointerValue<'a>), Error> {
+        if let Some(result) = self.indirect_dispatcher {
+            return Ok(result);
+        }
+
+        let i64t = context.i64_type();
+        let test_value_alloca = emit_data
+            .builder
+            .build_alloca(i64t, "indirect_dispatch_test_alloca");
+
+        let current_block = emit_data.builder.get_insert_block().unwrap();
+
+        let dispatch_block = context.append_basic_block(self.value, "indirect_dispatch_block");
+        emit_data.builder.position_at_end(dispatch_block);
+
+        let test_value =
+            emit_data
+                .builder
+                .build_load(i64t, test_value_alloca, "indirect_dispatch_test_value");
+
+        let failure_block = context.append_basic_block(self.value, "indirect_jump_failure_block");
+
+        let mut indirect_jump_targets: Vec<(u64, BasicBlock<'a>)> =
+            self.basic_blocks.iter().map(|(a, b)| (*a, *b)).collect();
+        indirect_jump_targets.sort_by_key(|(a, _)| *a);
+        emit_select_control(
+            context,
+            emit_data,
+            self.value,
+            dispatch_block,
+            test_value.into_int_value(),
+            &indirect_jump_targets,
+            failure_block,
+        )?;
+
+        emit_data.builder.position_at_end(failure_block);
+        // When binary search fails to find a basic block to execute, we use the
+        // Rust side interpreter to execute till the next basic block end, then
+        // repeat the binary search process.
+        // TODO: when code is really messy, we might end up in a situation that
+        // the code is jumping back-and-forth between binary search implemented
+        // as LLVM generated code now, and the native Rust side interpreter. An
+        // alternative solution is to move binary search to Rust side. We will need
+        // more studies to know where we shall put the binary search logic. For
+        // now, we leave the original binary search code unchanged here.
+        let (interpret_function, data) = emit_env_ffi_function(
+            context,
+            emit_data,
+            self.machine,
+            offset_of!(LlvmAotMachineEnv, interpret),
+        )?;
+        let mut interpret_args = [
+            interpret_function.into(),
+            data.into(),
+            i64t.const_int(0, false).into(),
+        ];
+        let interpret_result = emit_ffi_call(
+            context,
+            emit_data,
+            self,
+            &mut interpret_args,
+            true,
+            Some("interpret_function_result"),
+        )?;
+
+        let ret_block =
+            context.append_basic_block(self.value, "indirect_dispatch_interpret_ret_block");
+        let resume_block =
+            context.append_basic_block(self.value, "indirect_dispatch_interpret_resume_block");
+        let cmp = emit_data.builder.build_int_compare(
+            IntPredicate::EQ,
+            interpret_result,
+            i64t.const_int(BARE_FUNC_RETURN, false).into(),
+            "indirect_dispatch_interpret_result_is_return",
+        );
+        emit_data
+            .builder
+            .build_conditional_branch(cmp, ret_block, resume_block);
+
+        emit_data.builder.position_at_end(ret_block);
+        emit_data
+            .builder
+            .build_unconditional_branch(self.fetch_ret_block(context, emit_data)?);
+
+        emit_data.builder.position_at_end(resume_block);
+        emit_data
+            .builder
+            .build_store(test_value_alloca, interpret_result);
+        emit_data.builder.build_unconditional_branch(dispatch_block);
+
+        emit_data.builder.position_at_end(current_block);
+
+        self.indirect_dispatcher = Some((dispatch_block, test_value_alloca));
+
+        Ok((dispatch_block, test_value_alloca))
+    }
+
+    pub fn fetch_ret_block(
+        &mut self,
+        context: &'a Context,
+        emit_data: &EmitData<'a>,
+    ) -> Result<BasicBlock<'a>, Error> {
+        if let Some(block) = self.ret_block {
+            return Ok(block);
+        }
+
+        let current_block = emit_data.builder.get_insert_block().unwrap();
+
+        let ret_block = context.append_basic_block(self.value, "ret_block");
+        emit_data.builder.position_at_end(ret_block);
+
+        let i64t = context.i64_type();
+        let next_pc = emit_data
+            .builder
+            .build_load(i64t, self.pc_alloca, "target_pc")
+            .into_int_value();
+
+        let last_ra_val = emit_load_from_machine(
+            context,
+            emit_data,
+            self.machine,
+            offset_of!(LlvmAotCoreMachineData, last_ra),
+            i64t,
+            Some("last_ra"),
+        )?;
+        let cmp = emit_data.builder.build_int_compare(
+            IntPredicate::EQ,
+            next_pc,
+            last_ra_val,
+            "ra_cmp_last_ra",
+        );
+
+        let normal_ret_block = context.append_basic_block(self.value, "normal_ret_block");
+        let malformed_ret_block = context.append_basic_block(self.value, "malformed_ret_block");
+
+        emit_data
+            .builder
+            .build_conditional_branch(cmp, normal_ret_block, malformed_ret_block);
+
+        emit_data.builder.position_at_end(normal_ret_block);
+        emit_riscv_return(emit_data, &self.allocas)?;
+
+        emit_data.builder.position_at_end(malformed_ret_block);
+        emit_call_exit(context, emit_data, self, EXIT_REASON_MALFORMED_RETURN)?;
+
+        emit_data.builder.position_at_end(current_block);
+
+        self.ret_block = Some(ret_block);
+
+        return Ok(ret_block);
     }
 }
 
@@ -917,8 +1099,7 @@ fn emit_riscv_return<'a>(emit_data: &EmitData<'a>, allocas: &RegAllocas<'a>) -> 
 fn emit_call_riscv_func<'a>(
     context: &'a Context,
     emit_data: &EmitData<'a>,
-    machine: IntValue<'a>,
-    allocas: &RegAllocas<'a>,
+    emitting_func: &EmittingFunc<'a>,
     riscv_func_address: u64,
 ) -> Result<(), Error> {
     let func_llvm_value = *(emit_data
@@ -934,8 +1115,7 @@ fn emit_call_riscv_func<'a>(
     emit_call_riscv_func_with_func_value(
         context,
         emit_data,
-        machine,
-        allocas,
+        emitting_func,
         Either::Left(func_llvm_value),
     )
 }
@@ -943,11 +1123,12 @@ fn emit_call_riscv_func<'a>(
 fn emit_call_riscv_func_with_func_value<'a>(
     context: &'a Context,
     emit_data: &EmitData<'a>,
-    machine: IntValue<'a>,
-    allocas: &RegAllocas<'a>,
+    emitting_func: &EmittingFunc<'a>,
     func_llvm_value: Either<FunctionValue<'a>, PointerValue<'a>>,
 ) -> Result<(), Error> {
     let i64t = context.i64_type();
+    let machine = emitting_func.machine;
+    let allocas = &emitting_func.allocas;
 
     // Keep track of previous last_ra value for nested calls
     let previous_last_ra = emit_load_from_machine(
@@ -1024,17 +1205,16 @@ fn emit_call_riscv_func_with_func_value<'a>(
 fn emit_call_exit<'a>(
     context: &'a Context,
     emit_data: &EmitData<'a>,
-    machine: IntValue<'a>,
+    emitting_func: &EmittingFunc<'a>,
     reason: u8,
-    allocas: &RegAllocas<'a>,
 ) -> Result<(), Error> {
-    let values = allocas.load_values(emit_data)?;
+    let values = emitting_func.allocas.load_values(emit_data)?;
 
     let i8t = context.i8_type();
     emit_store_to_machine(
         context,
         emit_data,
-        machine,
+        emitting_func.machine,
         i8t.const_int(reason as u64, true),
         offset_of!(LlvmAotCoreMachineData, exit_aot_reason),
         i8t,
@@ -1094,9 +1274,7 @@ fn emit_env_ffi_function<'a>(
 fn emit_ffi_call<'a>(
     context: &'a Context,
     emit_data: &EmitData<'a>,
-    machine: IntValue<'a>,
-    function: FunctionValue<'a>,
-    allocas: &RegAllocas<'a>,
+    emitting_func: &EmittingFunc<'a>,
     args: &[BasicMetadataValueEnum<'a>; 3],
     side_effect: bool,
     name: Option<&str>,
@@ -1104,7 +1282,11 @@ fn emit_ffi_call<'a>(
     let name = name.unwrap_or("ffi_call_result");
 
     if side_effect {
-        emit_cleanup(context, emit_data, &allocas.load_values(emit_data)?)?;
+        emit_cleanup(
+            context,
+            emit_data,
+            &emitting_func.allocas.load_values(emit_data)?,
+        )?;
     }
 
     let result = emit_data
@@ -1115,17 +1297,24 @@ fn emit_ffi_call<'a>(
         .into_int_value();
 
     if side_effect {
-        allocas.store_values(emit_data, &emit_setup(context, emit_data, machine)?)?;
+        emitting_func.allocas.store_values(
+            emit_data,
+            &emit_setup(context, emit_data, emitting_func.machine)?,
+        )?;
     }
 
-    let success_block = context.append_basic_block(function, &format!("{}_success_block", name));
-    let failure_block = context.append_basic_block(function, &format!("{}_failure_block", name));
+    let success_block =
+        context.append_basic_block(emitting_func.value, &format!("{}_success_block", name));
+    let failure_block =
+        context.append_basic_block(emitting_func.value, &format!("{}_failure_block", name));
 
     let cmp = emit_data.builder.build_int_compare(
         IntPredicate::NE,
         result,
-        context.i64_type().const_int(0, false),
-        &format!("{}_ne_zero", name),
+        context
+            .i64_type()
+            .const_int(BARE_FUNC_ERROR_OR_TERMINATED, false),
+        &format!("{}_ne_error_or_terminated", name),
     );
     emit_data
         .builder
@@ -1135,9 +1324,8 @@ fn emit_ffi_call<'a>(
     emit_call_exit(
         context,
         emit_data,
-        machine,
+        emitting_func,
         EXIT_REASON_BARE_CALL_EXIT,
-        &allocas,
     )?;
 
     emit_data.builder.position_at_end(success_block);
@@ -1248,69 +1436,19 @@ fn emit_select_control<'a>(
     Ok(())
 }
 
-// In case a function contains indirect dispatches, we will emit a special
-// basic block used to locate the correct basic block after the indirect
-// dispatch.
-fn emit_indirect_dispatch_block<'a>(
-    context: &'a Context,
-    emit_data: &EmitData<'a>,
-    machine: IntValue<'a>,
-    function: FunctionValue<'a>,
-    allocas: &RegAllocas<'a>,
-    test_value_alloca: PointerValue<'a>,
-    basic_blocks: &HashMap<u64, BasicBlock<'a>>,
-) -> Result<BasicBlock<'a>, Error> {
-    let current_block = emit_data.builder.get_insert_block().unwrap();
-
-    let dispatch_block = context.append_basic_block(function, "indirect_dispatch_block");
-    emit_data.builder.position_at_end(dispatch_block);
-
-    let test_value = emit_data.builder.build_load(
-        context.i64_type(),
-        test_value_alloca,
-        "indirect_dispatch_test_value",
-    );
-
-    let failure_block = context.append_basic_block(function, "indirect_jump_failure_block");
-
-    let mut indirect_jump_targets: Vec<(u64, BasicBlock<'a>)> =
-        basic_blocks.iter().map(|(a, b)| (*a, *b)).collect();
-    indirect_jump_targets.sort_by_key(|(a, _)| *a);
-    emit_select_control(
-        context,
-        emit_data,
-        function,
-        dispatch_block,
-        test_value.into_int_value(),
-        &indirect_jump_targets,
-        failure_block,
-    )?;
-
-    emit_data.builder.position_at_end(failure_block);
-    emit_call_exit(
-        context,
-        emit_data,
-        machine,
-        EXIT_REASON_UNKNOWN_PC_VALUE,
-        &allocas,
-    )?;
-
-    emit_data.builder.position_at_end(current_block);
-
-    Ok(dispatch_block)
-}
-
 // Emit a CKB-VM AST value via LLVM
 fn emit_value<'a>(
     context: &'a Context,
     emit_data: &EmitData<'a>,
-    machine: IntValue<'a>,
-    memory_start: IntValue<'a>,
-    function: FunctionValue<'a>,
-    allocas: &RegAllocas<'a>,
+    emitting_func: &EmittingFunc<'a>,
     value: &Value,
     name: Option<&str>,
 ) -> Result<IntValue<'a>, Error> {
+    let machine = emitting_func.machine;
+    let memory_start = emitting_func.memory_start;
+    let function = emitting_func.value;
+    let allocas = &emitting_func.allocas;
+
     let force_name = name.unwrap_or("uKNOWn_value");
     let i64t = context.i64_type();
     let i1t = context.bool_type();
@@ -1322,10 +1460,7 @@ fn emit_value<'a>(
             let val = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*val,
                 Some(&format!("{}_val", force_name)),
             )?;
@@ -1484,20 +1619,14 @@ fn emit_value<'a>(
             let lhs = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*lhs,
                 Some(&format!("{}_lhs", force_name)),
             )?;
             let rhs = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*rhs,
                 Some(&format!("{}_rhs", force_name)),
             )?;
@@ -1781,20 +1910,14 @@ fn emit_value<'a>(
             let lhs = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*lhs,
                 Some(&format!("{}_lhs", force_name)),
             )?;
             let rhs = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*rhs_original,
                 Some(&format!("{}_rhs", force_name)),
             )?;
@@ -2055,30 +2178,21 @@ fn emit_value<'a>(
             let t = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*t,
                 Some(&format!("{}_t", force_name)),
             )?;
             let f = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*f,
                 Some(&format!("{}_f", force_name)),
             )?;
             let c = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*c,
                 Some(&format!("{}_c", force_name)),
             )?;
@@ -2101,10 +2215,7 @@ fn emit_value<'a>(
             let addr = emit_value(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                allocas,
+                &emitting_func,
                 &*addr,
                 Some(&format!("{}_addr", force_name)),
             )?;
@@ -2136,10 +2247,7 @@ fn emit_value<'a>(
 fn emit_writes<'a>(
     context: &'a Context,
     emit_data: &EmitData<'a>,
-    machine: IntValue<'a>,
-    memory_start: IntValue<'a>,
-    function: FunctionValue<'a>,
-    allocas: &RegAllocas<'a>,
+    emitting_func: &EmittingFunc<'a>,
     writes: &[Write],
     prefix: &str,
 ) -> Result<(), Error> {
@@ -2157,20 +2265,14 @@ fn emit_writes<'a>(
                 let address = emit_value(
                     context,
                     emit_data,
-                    machine,
-                    memory_start,
-                    function,
-                    allocas,
+                    emitting_func,
                     address,
                     Some(&format!("{}_address", prefix)),
                 )?;
                 let value = emit_value(
                     context,
                     emit_data,
-                    machine,
-                    memory_start,
-                    function,
-                    allocas,
+                    emitting_func,
                     value,
                     Some(&format!("{}_value", prefix)),
                 )?;
@@ -2187,10 +2289,7 @@ fn emit_writes<'a>(
                 let value = emit_value(
                     context,
                     emit_data,
-                    machine,
-                    memory_start,
-                    function,
-                    allocas,
+                    emitting_func,
                     value,
                     Some(&format!("{}_value", prefix)),
                 )?;
@@ -2202,7 +2301,7 @@ fn emit_writes<'a>(
 
     for (address, value, t, prefix) in memory_ops {
         let real_address_value = emit_data.builder.build_int_add(
-            memory_start,
+            emitting_func.memory_start,
             address,
             &format!("{}_real_addr_val", prefix),
         );
@@ -2214,7 +2313,14 @@ fn emit_writes<'a>(
         emit_data.builder.build_store(real_address, value);
     }
     for (index, value) in register_ops {
-        emit_store_reg(context, emit_data, machine, allocas, *index, value)?;
+        emit_store_reg(
+            context,
+            emit_data,
+            emitting_func.machine,
+            &emitting_func.allocas,
+            *index,
+            value,
+        )?;
     }
     Ok(())
 }
@@ -2298,86 +2404,95 @@ fn emit_riscv_func<'a>(
             .set_current_debug_location(debug_data.debug_location(context));
     }
 
-    // This is a dummy entry block in case some jumps point to the start of
-    // the function. LLVM does not allow predecessors for entry block.
-    let entry_block = context.append_basic_block(
-        function,
-        &format!("basic_block_entry_{}", func.force_name(true)),
-    );
+    let mut emitting_func = {
+        // This is a dummy entry block in case some jumps point to the start of
+        // the function. LLVM does not allow predecessors for entry block.
+        let entry_block = context.append_basic_block(
+            function,
+            &format!("basic_block_entry_{}", func.force_name(true)),
+        );
 
-    let basic_blocks: HashMap<u64, BasicBlock<'a>> = {
-        let mut bbs = HashMap::default();
+        let basic_blocks: HashMap<u64, BasicBlock<'a>> = {
+            let mut bbs = HashMap::default();
 
-        for block in &func.basic_blocks {
-            let b = context
-                .append_basic_block(function, &emit_data.basic_block_name(block.range.start));
+            for block in &func.basic_blocks {
+                let b = context
+                    .append_basic_block(function, &emit_data.basic_block_name(block.range.start));
 
-            bbs.insert(block.range.start, b);
-        }
+                bbs.insert(block.range.start, b);
+            }
 
-        bbs
-    };
-    emit_data.builder.position_at_end(entry_block);
-
-    // Fetch arguments
-    let args = {
-        let mut args = [i64t.const_int(0, false); 15];
-        for i in 0..15 {
-            args[i] = function.get_nth_param(i as u32).unwrap().into_int_value();
-        }
-        TransientValues::from_arguments(args)
-    };
-    let machine = args.extract_machine()?;
-
-    // Build allocas for arguments
-    let vars = {
-        let entry_block = function.get_first_basic_block().unwrap();
+            bbs
+        };
         emit_data.builder.position_at_end(entry_block);
 
-        let alloca_args = args.map(|arg, mapping| {
-            let var = emit_data
-                .builder
-                .build_alloca(i64t, &format!("alloc_{}", mapping));
-            emit_data.builder.build_store(var, arg);
-            Ok(var)
-        })?;
+        // Fetch arguments
+        let args = {
+            let mut args = [i64t.const_int(0, false); 15];
+            for i in 0..15 {
+                args[i] = function.get_nth_param(i as u32).unwrap().into_int_value();
+            }
+            TransientValues::from_arguments(args)
+        };
+        let machine = args.extract_machine()?;
 
-        RegAllocas::new(alloca_args, i64t)
+        // Build allocas for arguments
+        let vars = {
+            let entry_block = function.get_first_basic_block().unwrap();
+            emit_data.builder.position_at_end(entry_block);
+
+            let alloca_args = args.map(|arg, mapping| {
+                let var = emit_data
+                    .builder
+                    .build_alloca(i64t, &format!("alloc_{}", mapping));
+                emit_data.builder.build_store(var, arg);
+                Ok(var)
+            })?;
+
+            RegAllocas::new(alloca_args, i64t)
+        };
+        let pc_alloca = vars.pc_alloca()?;
+
+        // Build one memory_start construct per function
+        let memory_start = emit_load_from_machine(
+            context,
+            emit_data,
+            machine,
+            offset_of!(LlvmAotCoreMachineData, memory),
+            i64t,
+            Some("memory_start"),
+        )?;
+
+        EmittingFunc {
+            basic_blocks,
+            value: function,
+            machine,
+            allocas: vars,
+            pc_alloca,
+            memory_start,
+            indirect_dispatcher: None,
+            ret_block: None,
+        }
     };
-    let pc_alloca = vars.pc_alloca()?;
-
-    // Build one memory_start construct per function
-    let memory_start = emit_load_from_machine(
-        context,
-        emit_data,
-        machine,
-        offset_of!(LlvmAotCoreMachineData, memory),
-        i64t,
-        Some("memory_start"),
-    )?;
-
-    let indirect_dispatch_test_alloca = emit_data
-        .builder
-        .build_alloca(i64t, "indirect_dispatch_test_alloca");
 
     // Jump to the first actual basic block
     emit_data
         .builder
-        .build_unconditional_branch(basic_blocks[&func.range.start]);
+        .build_unconditional_branch(emitting_func.basic_blocks[&func.range.start]);
 
     let mut control_blocks: HashMap<u64, BasicBlock<'a>> = HashMap::default();
     // Emit code for each basic block
     for block in &func.basic_blocks {
         emit_data
             .builder
-            .position_at_end(basic_blocks[&block.range.start]);
+            .position_at_end(emitting_func.basic_blocks[&block.range.start]);
 
         if block.cycles > 0 {
             // Emit cycle calculation logic
             let current_cycles = emit_load_from_machine(
                 context,
                 emit_data,
-                machine,
+                emitting_func.machine,
                 offset_of!(LlvmAotCoreMachineData, cycles),
                 i64t,
                 Some("current_cycles"),
@@ -2385,7 +2500,7 @@ fn emit_riscv_func<'a>(
             let max_cycles = emit_load_from_machine(
                 context,
                 emit_data,
-                machine,
+                emitting_func.machine,
                 offset_of!(LlvmAotCoreMachineData, max_cycles),
                 i64t,
                 Some("max_cycles"),
@@ -2433,9 +2548,8 @@ fn emit_riscv_func<'a>(
             emit_call_exit(
                 context,
                 emit_data,
-                machine,
+                &emitting_func,
                 EXIT_REASON_CYCLES_OVERFLOW,
-                &vars,
             )?;
             emit_data.builder.position_at_end(cycle_no_overflow_block);
             emit_data.builder.build_conditional_branch(
@@ -2447,15 +2561,14 @@ fn emit_riscv_func<'a>(
             emit_call_exit(
                 context,
                 emit_data,
-                machine,
+                &emitting_func,
                 EXIT_REASON_MAX_CYCLES_EXCEEDED,
-                &vars,
             )?;
             emit_data.builder.position_at_end(cycle_ok_block);
             emit_store_to_machine(
                 context,
                 emit_data,
-                machine,
+                emitting_func.machine,
                 updated_cycles,
                 offset_of!(LlvmAotCoreMachineData, cycles),
                 i64t,
@@ -2474,16 +2587,7 @@ fn emit_riscv_func<'a>(
                 }
             }
             let prefix = format!("batch{}", i);
-            emit_writes(
-                context,
-                emit_data,
-                machine,
-                memory_start,
-                function,
-                &vars,
-                &write_batch,
-                &prefix,
-            )?;
+            emit_writes(context, emit_data, &emitting_func, &write_batch, &prefix)?;
         }
 
         // Update PC & writes together with PC
@@ -2498,10 +2602,7 @@ fn emit_riscv_func<'a>(
         let next_pc = emit_value(
             context,
             emit_data,
-            machine,
-            memory_start,
-            function,
-            &vars,
+            &emitting_func,
             &block.control.pc(),
             Some("pc"),
         )?;
@@ -2509,15 +2610,14 @@ fn emit_riscv_func<'a>(
             emit_writes(
                 context,
                 emit_data,
-                machine,
-                memory_start,
-                function,
-                &vars,
+                &emitting_func,
                 last_writes,
                 "last_write",
             )?;
         }
-        emit_data.builder.build_store(pc_alloca, next_pc);
+        emit_data
+            .builder
+            .build_store(emitting_func.pc_alloca, next_pc);
 
         let control_block = context.append_basic_block(
             function,
@@ -2529,7 +2629,6 @@ fn emit_riscv_func<'a>(
         control_blocks.insert(block.range.start, control_block);
     }
 
-    let mut indirect_dispatch_block = None;
     // Emit code for each control block
     for block in &func.basic_blocks {
         emit_data
@@ -2538,7 +2637,7 @@ fn emit_riscv_func<'a>(
 
         let next_pc = emit_data
             .builder
-            .build_load(i64t, pc_alloca, "target_pc")
+            .build_load(i64t, emitting_func.pc_alloca, "target_pc")
             .into_int_value();
 
         // Emit control flow changes, there might be several cases:
@@ -2558,36 +2657,21 @@ fn emit_riscv_func<'a>(
         match &block.control {
             Control::Jump { pc, .. } => match pc {
                 Value::Imm(i) => {
-                    if let Some(target_block) = basic_blocks.get(i) {
+                    if let Some(target_block) = emitting_func.basic_blocks.get(i) {
                         // 1(a)
                         emit_data.builder.build_unconditional_branch(*target_block);
-                    } else {
-                        emit_call_exit(
-                            context,
-                            emit_data,
-                            machine,
-                            EXIT_REASON_UNKNOWN_BLOCK,
-                            &vars,
-                        )?;
+                        terminated = true;
                     }
-                    terminated = true;
                 }
                 Value::Cond(c, t, f) => {
                     if let (Value::Imm(t), Value::Imm(f)) = (&**t, &**f) {
-                        if let (Some(true_block), Some(false_block)) =
-                            (basic_blocks.get(t), basic_blocks.get(f))
-                        {
+                        if let (Some(true_block), Some(false_block)) = (
+                            emitting_func.basic_blocks.get(t),
+                            emitting_func.basic_blocks.get(f),
+                        ) {
                             // 1(b)
-                            let c = emit_value(
-                                context,
-                                emit_data,
-                                machine,
-                                memory_start,
-                                function,
-                                &vars,
-                                c,
-                                Some("pc_cond"),
-                            )?;
+                            let c =
+                                emit_value(context, emit_data, &emitting_func, c, Some("pc_cond"))?;
                             let c = emit_data.builder.build_int_compare(
                                 IntPredicate::EQ,
                                 c,
@@ -2603,96 +2687,21 @@ fn emit_riscv_func<'a>(
                         }
                     }
                 }
-                _ => {
-                    // Indirect jump here. Use interpreter to execute till next basic
-                    // block end.
-                    if indirect_dispatch_block.is_none() {
-                        indirect_dispatch_block = Some(emit_indirect_dispatch_block(
-                            context,
-                            emit_data,
-                            machine,
-                            function,
-                            &vars,
-                            indirect_dispatch_test_alloca,
-                            &basic_blocks,
-                        )?);
-                    }
-                    let (interpret_function, data) = emit_env_ffi_function(
-                        context,
-                        emit_data,
-                        machine,
-                        offset_of!(LlvmAotMachineEnv, interpret),
-                    )?;
-                    let mut interpret_args = [
-                        interpret_function.into(),
-                        data.into(),
-                        i64t.const_int(0, false).into(),
-                    ];
-                    let interpret_result = emit_ffi_call(
-                        context,
-                        emit_data,
-                        machine,
-                        function,
-                        &vars,
-                        &mut interpret_args,
-                        true,
-                        Some("interpret_function_result"),
-                    )?;
-
-                    let ret_block = context.append_basic_block(function, "indirect_ret_block");
-                    let jump_block = context.append_basic_block(function, "indirect_jump_block");
-
-                    let last_ra_val = emit_load_from_machine(
-                        context,
-                        emit_data,
-                        machine,
-                        offset_of!(LlvmAotCoreMachineData, last_ra),
-                        i64t,
-                        Some("last_ra"),
-                    )?;
-                    let cmp = emit_data.builder.build_int_compare(
-                        IntPredicate::EQ,
-                        interpret_result,
-                        last_ra_val,
-                        "pc_cmp_last_ra",
-                    );
-                    emit_data
-                        .builder
-                        .build_conditional_branch(cmp, ret_block, jump_block);
-
-                    emit_data.builder.position_at_end(ret_block);
-                    emit_riscv_return(emit_data, &vars)?;
-
-                    emit_data.builder.position_at_end(jump_block);
-                    emit_data
-                        .builder
-                        .build_store(indirect_dispatch_test_alloca, interpret_result);
-                    emit_data
-                        .builder
-                        .build_unconditional_branch(indirect_dispatch_block.unwrap());
-                    terminated = true;
-                }
+                _ => {}
             },
             Control::Call { address, .. } => {
                 // 2
-                emit_call_riscv_func(context, emit_data, machine, &vars, *address)?;
+                emit_call_riscv_func(context, emit_data, &emitting_func, *address)?;
                 if let Some(resume_address) = block.control.call_resume_address() {
                     // When returned from the call, update PC using resume address
-                    emit_data
-                        .builder
-                        .build_store(pc_alloca, i64t.const_int(resume_address, false));
-                    if let Some(resume_block) = basic_blocks.get(&resume_address) {
+                    emit_data.builder.build_store(
+                        emitting_func.pc_alloca,
+                        i64t.const_int(resume_address, false),
+                    );
+                    if let Some(resume_block) = emitting_func.basic_blocks.get(&resume_address) {
                         emit_data.builder.build_unconditional_branch(*resume_block);
-                    } else {
-                        emit_call_exit(
-                            context,
-                            emit_data,
-                            machine,
-                            EXIT_REASON_UNKNOWN_RESUME_ADDRESS,
-                            &vars,
-                        )?;
+                        terminated = true;
                     }
-                    terminated = true;
                 }
             }
             Control::IndirectCall { .. } => {
@@ -2701,24 +2710,22 @@ fn emit_riscv_func<'a>(
                 let (query_function, data) = emit_env_ffi_function(
                     context,
                     emit_data,
-                    machine,
+                    emitting_func.machine,
                     offset_of!(LlvmAotMachineEnv, query_function),
                 )?;
                 let mut query_args = [query_function.into(), data.into(), next_pc.into()];
                 let query_result = emit_ffi_call(
                     context,
                     emit_data,
-                    machine,
-                    function,
-                    &vars,
+                    &emitting_func,
                     &mut query_args,
                     false,
                     Some("query_function_result"),
                 )?;
                 // There might be 3 cases here:
-                // * query_result is 0: errors happen at Rust side, this case
-                // is handled within +emit_ffi_call+
-                // * query_result is +u64::max_value()+, meaning Rust side failed
+                // * query_result is +BARE_FUNC_ERROR_OR_TERMINATED+: errors happen at
+                // Rust side, this case is handled within +emit_ffi_call+
+                // * query_result is +BARE_FUNC_MISSING+, meaning Rust side failed
                 // to find a native function. There might still be a case we want
                 // to handle: loop unrolling generates from a function within current
                 // function. See +memset+ from +newlib+ for an example here. In
@@ -2728,137 +2735,69 @@ fn emit_riscv_func<'a>(
                 // call.
                 let normal_call_block = context.append_basic_block(function, "normal_call_block");
                 let interpret_block = context.append_basic_block(function, "interpret_block");
-                let failure_block = context.append_basic_block(function, "failure_block");
+                let resume_block = context.append_basic_block(function, "resume_block");
 
                 let cmp = emit_data.builder.build_int_compare(
                     IntPredicate::NE,
                     query_result,
-                    i64t.const_int(u64::max_value(), false),
+                    i64t.const_int(BARE_FUNC_MISSING, false),
                     "cmp_query_result_to_invalid_address",
                 );
                 emit_data
                     .builder
                     .build_conditional_branch(cmp, normal_call_block, interpret_block);
 
-                emit_data.builder.position_at_end(failure_block);
-                emit_call_exit(
-                    context,
-                    emit_data,
-                    machine,
-                    EXIT_REASON_MALFORMED_INDIRECT_CALL,
-                    &vars,
-                )?;
-
                 emit_data.builder.position_at_end(normal_call_block);
+                // When a proper function is returned(non-zero), use the function
+                // to build the actual RISC-V call.
                 let query_result_function = emit_data.builder.build_int_to_ptr(
                     query_result,
                     riscv_function_type(context).ptr_type(AddressSpace::default()),
                     "query_function_result_function",
                 );
-                // When a proper function is returned(non-zero), use the function
-                // to build the actual RISC-V call.
                 emit_call_riscv_func_with_func_value(
                     context,
                     emit_data,
-                    machine,
-                    &vars,
+                    &emitting_func,
                     Either::Right(query_result_function),
                 )?;
-                if let Some(resume_address) = block.control.call_resume_address() {
-                    // When returned from the call, update PC using resume address
-                    emit_data
-                        .builder
-                        .build_store(pc_alloca, i64t.const_int(resume_address, false));
-                    if let Some(resume_block) = basic_blocks.get(&resume_address) {
-                        emit_data.builder.build_unconditional_branch(*resume_block);
-                    } else {
-                        emit_call_exit(
-                            context,
-                            emit_data,
-                            machine,
-                            EXIT_REASON_UNKNOWN_RESUME_ADDRESS,
-                            &vars,
-                        )?;
-                    }
-                } else {
-                    return Err(Error::External(format!(
-                        "Invalid resume address: {}",
-                        block.control
-                    )));
-                }
+                emit_data.builder.build_unconditional_branch(resume_block);
 
                 emit_data.builder.position_at_end(interpret_block);
-                // Ensure next_pc is within current function
-                // TODO: we could also expand this to interpret a whole function
-                // at a different place.
-                let cmp_left = emit_data.builder.build_int_compare(
-                    IntPredicate::UGE,
-                    next_pc,
-                    i64t.const_int(func.range.start, false),
-                    "cmp_next_pc_to_func_start",
-                );
-                let cmp_right = emit_data.builder.build_int_compare(
-                    IntPredicate::ULT,
-                    next_pc,
-                    i64t.const_int(func.range.end, false),
-                    "cmp_next_pc_to_func_end",
-                );
-                let cmp_both =
-                    emit_data
-                        .builder
-                        .build_and(cmp_left, cmp_right, "cmp_next_pc_both_pred");
-
-                let interpret_valid_block =
-                    context.append_basic_block(function, "interpret_valid_block");
-
-                emit_data.builder.build_conditional_branch(
-                    cmp_both,
-                    interpret_valid_block,
-                    failure_block,
-                );
-                emit_data.builder.position_at_end(interpret_valid_block);
-
-                // Interpret to the next basic block end
-                if indirect_dispatch_block.is_none() {
-                    indirect_dispatch_block = Some(emit_indirect_dispatch_block(
-                        context,
-                        emit_data,
-                        machine,
-                        function,
-                        &vars,
-                        indirect_dispatch_test_alloca,
-                        &basic_blocks,
-                    )?);
-                }
+                // Call the function via Rust side interpreter
                 let (interpret_function, data) = emit_env_ffi_function(
                     context,
                     emit_data,
-                    machine,
+                    emitting_func.machine,
                     offset_of!(LlvmAotMachineEnv, interpret),
                 )?;
                 let mut interpret_args = [
                     interpret_function.into(),
                     data.into(),
-                    i64t.const_int(0, false).into(),
+                    i64t.const_int(1, false).into(),
                 ];
-                let interpret_result = emit_ffi_call(
+                emit_ffi_call(
                     context,
                     emit_data,
-                    machine,
-                    function,
-                    &vars,
+                    &emitting_func,
                     &mut interpret_args,
                     true,
                     Some("interpret_function_result"),
                 )?;
-                // Dispatch to the correct basic block
-                emit_data
-                    .builder
-                    .build_store(indirect_dispatch_test_alloca, interpret_result);
-                emit_data
-                    .builder
-                    .build_unconditional_branch(indirect_dispatch_block.unwrap());
-                terminated = true;
+                emit_data.builder.build_unconditional_branch(resume_block);
+
+                emit_data.builder.position_at_end(resume_block);
+                if let Some(resume_address) = block.control.call_resume_address() {
+                    // When returned from the call, update PC using resume address
+                    emit_data.builder.build_store(
+                        emitting_func.pc_alloca,
+                        i64t.const_int(resume_address, false),
+                    );
+                    if let Some(resume_block) = emitting_func.basic_blocks.get(&resume_address) {
+                        emit_data.builder.build_unconditional_branch(*resume_block);
+                        terminated = true;
+                    }
+                }
             }
             Control::Tailcall { address, .. } => {
                 // 2
@@ -2867,7 +2806,7 @@ fn emit_riscv_func<'a>(
                         Error::External(format!("Function at 0x{:x} does not exist!", address))
                     })?);
 
-                let values = vars.load_values(emit_data)?;
+                let values = emitting_func.allocas.load_values(emit_data)?;
                 let invoke_args = values.to_arguments()?;
                 let result = emit_data.builder.build_call(
                     func_llvm_value,
@@ -2883,39 +2822,8 @@ fn emit_riscv_func<'a>(
             }
             Control::Return { .. } => {
                 // 3
-                let last_ra_val = emit_load_from_machine(
-                    context,
-                    emit_data,
-                    machine,
-                    offset_of!(LlvmAotCoreMachineData, last_ra),
-                    i64t,
-                    Some("last_ra"),
-                )?;
-                let cmp = emit_data.builder.build_int_compare(
-                    IntPredicate::EQ,
-                    next_pc,
-                    last_ra_val,
-                    "ra_cmp_last_ra",
-                );
-
-                let ret_block = context.append_basic_block(function, "ret_block");
-                let exit_block = context.append_basic_block(function, "exit_block");
-
-                emit_data
-                    .builder
-                    .build_conditional_branch(cmp, ret_block, exit_block);
-
-                emit_data.builder.position_at_end(ret_block);
-                emit_riscv_return(emit_data, &vars)?;
-
-                emit_data.builder.position_at_end(exit_block);
-                emit_call_exit(
-                    context,
-                    emit_data,
-                    machine,
-                    EXIT_REASON_MALFORMED_RETURN,
-                    &vars,
-                )?;
+                let ret_block = emitting_func.fetch_ret_block(context, emit_data)?;
+                emit_data.builder.build_unconditional_branch(ret_block);
 
                 terminated = true;
             }
@@ -2924,7 +2832,7 @@ fn emit_riscv_func<'a>(
                 let (ecall_function, data) = emit_env_ffi_function(
                     context,
                     emit_data,
-                    machine,
+                    emitting_func.machine,
                     offset_of!(LlvmAotMachineEnv, ecall),
                 )?;
                 let mut ecall_args = [
@@ -2935,32 +2843,22 @@ fn emit_riscv_func<'a>(
                 emit_ffi_call(
                     context,
                     emit_data,
-                    machine,
-                    function,
-                    &vars,
+                    &emitting_func,
                     &mut ecall_args,
                     true,
                     None,
                 )?;
-                if let Some(target_block) = basic_blocks.get(&block.range.end) {
+                if let Some(target_block) = emitting_func.basic_blocks.get(&block.range.end) {
                     emit_data.builder.build_unconditional_branch(*target_block);
-                } else {
-                    emit_call_exit(
-                        context,
-                        emit_data,
-                        machine,
-                        EXIT_REASON_ECALL_UNREACHABLE,
-                        &vars,
-                    )?;
+                    terminated = true;
                 }
-                terminated = true;
             }
             Control::Ebreak { .. } => {
                 // 5
                 let (ebreak_function, data) = emit_env_ffi_function(
                     context,
                     emit_data,
-                    machine,
+                    emitting_func.machine,
                     offset_of!(LlvmAotMachineEnv, ebreak),
                 )?;
                 let mut ebreak_args = [
@@ -2971,33 +2869,22 @@ fn emit_riscv_func<'a>(
                 emit_ffi_call(
                     context,
                     emit_data,
-                    machine,
-                    function,
-                    &vars,
+                    &emitting_func,
                     &mut ebreak_args,
                     true,
                     None,
                 )?;
-                if let Some(target_block) = basic_blocks.get(&block.range.end) {
+                if let Some(target_block) = emitting_func.basic_blocks.get(&block.range.end) {
                     emit_data.builder.build_unconditional_branch(*target_block);
-                } else {
-                    emit_call_exit(
-                        context,
-                        emit_data,
-                        machine,
-                        EXIT_REASON_EBREAK_UNREACHABLE,
-                        &vars,
-                    )?;
+                    terminated = true;
                 }
-                terminated = true;
             }
         }
 
         if !terminated {
-            return Err(Error::External(format!(
-                "Unexpected control structure: {:?}",
-                block.control
-            )));
+            // Arbitrary jump here. Use interpreter to execute till next basic
+            // block end.
+            emitting_func.emit_arbitrary_jump(context, emit_data, next_pc)?;
         }
     }
 

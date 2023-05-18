@@ -51,10 +51,6 @@ struct Args {
     #[clap(short, long)]
     debug_info: bool,
 
-    /// Running in fast mode
-    #[clap(short, long)]
-    fast: bool,
-
     /// Max cycles when running the program
     #[clap(short, long, default_value = "18446744073709551615")]
     max_cycles: u64,
@@ -168,7 +164,7 @@ fn main() -> Result<(), Error> {
                 .collect();
             let t0 = SystemTime::now();
             machine.load_program(&code, &run_args)?;
-            let exit = machine.run(args.fast);
+            let exit = machine.run();
             if args.time {
                 let t1 = SystemTime::now();
                 let duration = t1.duration_since(t0).expect("time went backwards");
