@@ -20,7 +20,7 @@ use std::slice::from_raw_parts_mut;
 
 const RUNTIME_FLAG_RUNNING: u8 = 1;
 
-pub const EXIT_REASON_MALFORMED_RETURN: u8 = 101;
+pub const EXIT_REASON_REVERT_TO_INTERPRETER: u8 = 101;
 pub const EXIT_REASON_MAX_CYCLES_EXCEEDED: u8 = 102;
 pub const EXIT_REASON_CYCLES_OVERFLOW: u8 = 103;
 pub const EXIT_REASON_BARE_CALL_EXIT: u8 = 104;
@@ -207,7 +207,7 @@ impl LlvmAotMachine {
                 match result {
                     // At this stage, we are already back at Rust interpreter stack, no further
                     // action is required for OSR.
-                    EXIT_REASON_MALFORMED_RETURN => (),
+                    EXIT_REASON_REVERT_TO_INTERPRETER => (),
                     EXIT_REASON_BARE_CALL_EXIT => {
                         if self.machine.running() {
                             return Err(Error::External(
