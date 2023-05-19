@@ -37,6 +37,7 @@ use inkwell::{
     AddressSpace, IntPredicate, OptimizationLevel,
 };
 use lazy_static::lazy_static;
+use log::debug;
 use memoffset::offset_of;
 use std::collections::HashMap;
 use std::fmt;
@@ -2901,7 +2902,7 @@ fn emit_riscv_func<'a>(
         }
 
         if !terminated {
-            println!(
+            debug!(
                 "Control that triggers arbitrary jump: {:?}, block: {:x}",
                 block.control, block.range.start
             );
