@@ -4,7 +4,8 @@ use super::{
     runner::{
         LlvmAotCoreMachineData, LlvmAotMachineEnv, BARE_FUNC_ERROR_OR_TERMINATED,
         BARE_FUNC_MISSING, BARE_FUNC_RETURN, EXIT_REASON_BARE_CALL_EXIT,
-        EXIT_REASON_CYCLES_OVERFLOW, EXIT_REASON_MALFORMED_RETURN, EXIT_REASON_MAX_CYCLES_EXCEEDED,
+        EXIT_REASON_CYCLES_OVERFLOW, EXIT_REASON_MAX_CYCLES_EXCEEDED,
+        EXIT_REASON_REVERT_TO_INTERPRETER,
     },
 };
 use ckb_vm::{
@@ -357,7 +358,7 @@ impl<'a> EmittingFunc<'a> {
         emit_riscv_return(emit_data, &self.allocas)?;
 
         emit_data.builder.position_at_end(malformed_ret_block);
-        emit_call_exit(context, emit_data, self, EXIT_REASON_MALFORMED_RETURN)?;
+        emit_call_exit(context, emit_data, self, EXIT_REASON_REVERT_TO_INTERPRETER)?;
 
         emit_data.builder.position_at_end(current_block);
 
@@ -2856,8 +2857,20 @@ fn emit_riscv_func<'a>(
                 )?;
                 if let Some(target_block) = emitting_func.basic_blocks.get(&block.range.end) {
                     emit_data.builder.build_unconditional_branch(*target_block);
-                    terminated = true;
+                } else {
+                    // There might be cases that an ecall is put at the very end
+                    // of code section to exit the program. For well-organized
+                    // program, this might be the only place that is triggering
+                    // an unnecessary arbitrary jump. Hence we will choose to revert
+                    // to interpreter code here for a better tradeoff.
+                    emit_call_exit(
+                        context,
+                        emit_data,
+                        &emitting_func,
+                        EXIT_REASON_REVERT_TO_INTERPRETER,
+                    )?;
                 }
+                terminated = true;
             }
             Control::Ebreak { .. } => {
                 // 5
@@ -2888,6 +2901,10 @@ fn emit_riscv_func<'a>(
         }
 
         if !terminated {
+            println!(
+                "Control that triggers arbitrary jump: {:?}, block: {:x}",
+                block.control, block.range.start
+            );
             // Arbitrary jump here. Use interpreter to execute till next basic
             // block end.
             emitting_func.emit_arbitrary_jump(context, emit_data, next_pc)?;
