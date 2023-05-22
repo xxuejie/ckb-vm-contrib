@@ -3134,7 +3134,7 @@ fn emit<'a>(
     }
     for func in &emit_data.code.funcs {
         let function = emit_data.emitted_funcs[&func.range.start];
-        if !function.verify(true) {
+        if !function.verify(false) {
             return Err(Error::External(format!(
                 "verifying function {} at 0x{:x}",
                 func.force_name(true),
