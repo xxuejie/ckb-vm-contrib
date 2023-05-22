@@ -27,7 +27,6 @@ pub const EXIT_REASON_BARE_CALL_EXIT: u8 = 104;
 
 pub const BARE_FUNC_ERROR_OR_TERMINATED: u64 = u64::MAX;
 pub const BARE_FUNC_RETURN: u64 = u64::MAX - 1;
-pub const BARE_FUNC_MISSING: u64 = u64::MAX - 2;
 
 pub struct LlvmAotMachine {
     pub machine: DefaultMachine<LlvmAotCoreMachine>,
@@ -46,8 +45,8 @@ pub struct LlvmAotMachineEnv {
     pub data: *mut LlvmAotMachine,
     pub ecall: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub ebreak: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
-    pub query_function: unsafe extern "C" fn(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64,
-    pub interpret: unsafe extern "C" fn(m: *mut LlvmAotMachine, return_on_call: u64) -> u64,
+    pub indirect_call: unsafe extern "C" fn(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64,
+    pub arbitrary_jump: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
 }
 
 unsafe extern "C" fn bare_ecall(m: *mut LlvmAotMachine) -> u64 {
@@ -84,16 +83,23 @@ unsafe extern "C" fn bare_ebreak(m: *mut LlvmAotMachine) -> u64 {
     }
 }
 
-unsafe extern "C" fn bare_query_function(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64 {
-    let m = &*m;
-    *m.function_mapping
-        .get(&riscv_addr)
-        .unwrap_or(&BARE_FUNC_MISSING)
+unsafe extern "C" fn bare_indirect_call(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64 {
+    let m = &mut *m;
+    match m.function_mapping.get(&riscv_addr) {
+        Some(native_addr) => *native_addr,
+        None => match inner_interpret(m, true) {
+            Ok(call_end) => call_end,
+            Err(e) => {
+                m.bare_call_error = Some(e);
+                BARE_FUNC_ERROR_OR_TERMINATED
+            }
+        },
+    }
 }
 
-unsafe extern "C" fn bare_interpret(m: *mut LlvmAotMachine, return_on_call: u64) -> u64 {
+unsafe extern "C" fn bare_arbitrary_jump(m: *mut LlvmAotMachine) -> u64 {
     let mut m = &mut *m;
-    match inner_interpret(&mut m, return_on_call != 0) {
+    match inner_interpret(&mut m, false) {
         Ok(block_end) => block_end,
         Err(e) => {
             m.bare_call_error = Some(e);
@@ -251,8 +257,8 @@ impl LlvmAotMachine {
             data: self as *const LlvmAotMachine as *mut LlvmAotMachine,
             ecall: bare_ecall,
             ebreak: bare_ebreak,
-            query_function: bare_query_function,
-            interpret: bare_interpret,
+            indirect_call: bare_indirect_call,
+            arbitrary_jump: bare_arbitrary_jump,
         }
     }
 }

@@ -2,9 +2,8 @@ use super::{
     ast::{register_names, Control, Write},
     preprocessor::{preprocess, Func},
     runner::{
-        LlvmAotCoreMachineData, LlvmAotMachineEnv, BARE_FUNC_ERROR_OR_TERMINATED,
-        BARE_FUNC_MISSING, BARE_FUNC_RETURN, EXIT_REASON_BARE_CALL_EXIT,
-        EXIT_REASON_CYCLES_OVERFLOW, EXIT_REASON_MAX_CYCLES_EXCEEDED,
+        LlvmAotCoreMachineData, LlvmAotMachineEnv, BARE_FUNC_ERROR_OR_TERMINATED, BARE_FUNC_RETURN,
+        EXIT_REASON_BARE_CALL_EXIT, EXIT_REASON_CYCLES_OVERFLOW, EXIT_REASON_MAX_CYCLES_EXCEEDED,
         EXIT_REASON_REVERT_TO_INTERPRETER,
     },
 };
@@ -265,7 +264,7 @@ impl<'a> EmittingFunc<'a> {
             context,
             emit_data,
             self.machine,
-            offset_of!(LlvmAotMachineEnv, interpret),
+            offset_of!(LlvmAotMachineEnv, arbitrary_jump),
         )?;
         let mut interpret_args = [
             interpret_function.into(),
@@ -277,7 +276,6 @@ impl<'a> EmittingFunc<'a> {
             emit_data,
             self,
             &mut interpret_args,
-            true,
             Some("interpret_function_result"),
         )?;
 
@@ -1279,18 +1277,15 @@ fn emit_ffi_call<'a>(
     emit_data: &EmitData<'a>,
     emitting_func: &EmittingFunc<'a>,
     args: &[BasicMetadataValueEnum<'a>; 3],
-    side_effect: bool,
     name: Option<&str>,
 ) -> Result<IntValue<'a>, Error> {
     let name = name.unwrap_or("ffi_call_result");
 
-    if side_effect {
-        emit_cleanup(
-            context,
-            emit_data,
-            &emitting_func.allocas.load_values(emit_data)?,
-        )?;
-    }
+    emit_cleanup(
+        context,
+        emit_data,
+        &emitting_func.allocas.load_values(emit_data)?,
+    )?;
 
     let result = emit_data
         .builder
@@ -1299,12 +1294,10 @@ fn emit_ffi_call<'a>(
         .unwrap_left()
         .into_int_value();
 
-    if side_effect {
-        emitting_func.allocas.store_values(
-            emit_data,
-            &emit_setup(context, emit_data, emitting_func.machine)?,
-        )?;
-    }
+    emitting_func.allocas.store_values(
+        emit_data,
+        &emit_setup(context, emit_data, emitting_func.machine)?,
+    )?;
 
     let success_block =
         context.append_basic_block(emitting_func.value, &format!("{}_success_block", name));
@@ -2714,83 +2707,55 @@ fn emit_riscv_func<'a>(
             }
             Control::IndirectCall { .. } => {
                 // 2
-                // First, query the function to call via LlvmAotMachineEnv
-                let (query_function, data) = emit_env_ffi_function(
+                // Make the call via native function exposed by LlvmAotMachineEnv
+                let (call_function, data) = emit_env_ffi_function(
                     context,
                     emit_data,
                     emitting_func.machine,
-                    offset_of!(LlvmAotMachineEnv, query_function),
+                    offset_of!(LlvmAotMachineEnv, indirect_call),
                 )?;
-                let mut query_args = [query_function.into(), data.into(), next_pc.into()];
-                let query_result = emit_ffi_call(
+                let mut call_args = [call_function.into(), data.into(), next_pc.into()];
+                let call_result = emit_ffi_call(
                     context,
                     emit_data,
                     &emitting_func,
-                    &mut query_args,
-                    false,
-                    Some("query_function_result"),
+                    &mut call_args,
+                    Some("call_function_result"),
                 )?;
                 // There might be 3 cases here:
-                // * query_result is +BARE_FUNC_ERROR_OR_TERMINATED+: errors happen at
+                // * call_result is +BARE_FUNC_ERROR_OR_TERMINATED+: errors happen at
                 // Rust side, this case is handled within +emit_ffi_call+
-                // * query_result is +BARE_FUNC_MISSING+, meaning Rust side failed
-                // to find a native function. There might still be a case we want
-                // to handle: loop unrolling generates from a function within current
-                // function. See +memset+ from +newlib+ for an example here. In
-                // this case, we first test if +next_pc+ lies within current function,
-                // if so, we will handle it like an indirect jump.
+                // * call_result is +BARE_FUNC_RETURN+, meaning Rust side has finished
+                // executed the called function and reached the return statement, here we
+                // shall simply jump to resume block location.
                 // * Any other value will be treated like a proper x64 function to
                 // call.
                 let normal_call_block = context.append_basic_block(function, "normal_call_block");
-                let interpret_block = context.append_basic_block(function, "interpret_block");
                 let resume_block = context.append_basic_block(function, "resume_block");
 
                 let cmp = emit_data.builder.build_int_compare(
                     IntPredicate::NE,
-                    query_result,
-                    i64t.const_int(BARE_FUNC_MISSING, false),
-                    "cmp_query_result_to_invalid_address",
+                    call_result,
+                    i64t.const_int(BARE_FUNC_RETURN, false),
+                    "cmp_call_result_to_invalid_address",
                 );
                 emit_data
                     .builder
-                    .build_conditional_branch(cmp, normal_call_block, interpret_block);
+                    .build_conditional_branch(cmp, normal_call_block, resume_block);
 
                 emit_data.builder.position_at_end(normal_call_block);
                 // When a proper function is returned(non-zero), use the function
                 // to build the actual RISC-V call.
-                let query_result_function = emit_data.builder.build_int_to_ptr(
-                    query_result,
+                let call_result_function = emit_data.builder.build_int_to_ptr(
+                    call_result,
                     riscv_function_type(context).ptr_type(AddressSpace::default()),
-                    "query_function_result_function",
+                    "call_function_result_function",
                 );
                 emit_call_riscv_func_with_func_value(
                     context,
                     emit_data,
                     &emitting_func,
-                    Either::Right(query_result_function),
-                )?;
-                emit_data.builder.build_unconditional_branch(resume_block);
-
-                emit_data.builder.position_at_end(interpret_block);
-                // Call the function via Rust side interpreter
-                let (interpret_function, data) = emit_env_ffi_function(
-                    context,
-                    emit_data,
-                    emitting_func.machine,
-                    offset_of!(LlvmAotMachineEnv, interpret),
-                )?;
-                let mut interpret_args = [
-                    interpret_function.into(),
-                    data.into(),
-                    i64t.const_int(1, false).into(),
-                ];
-                emit_ffi_call(
-                    context,
-                    emit_data,
-                    &emitting_func,
-                    &mut interpret_args,
-                    true,
-                    Some("interpret_function_result"),
+                    Either::Right(call_result_function),
                 )?;
                 emit_data.builder.build_unconditional_branch(resume_block);
 
@@ -2848,14 +2813,7 @@ fn emit_riscv_func<'a>(
                     data.into(),
                     i64t.const_int(0, false).into(),
                 ];
-                emit_ffi_call(
-                    context,
-                    emit_data,
-                    &emitting_func,
-                    &mut ecall_args,
-                    true,
-                    None,
-                )?;
+                emit_ffi_call(context, emit_data, &emitting_func, &mut ecall_args, None)?;
                 if let Some(target_block) = emitting_func.basic_blocks.get(&block.range.end) {
                     emit_data.builder.build_unconditional_branch(*target_block);
                 } else {
@@ -2886,14 +2844,7 @@ fn emit_riscv_func<'a>(
                     data.into(),
                     i64t.const_int(0, false).into(),
                 ];
-                emit_ffi_call(
-                    context,
-                    emit_data,
-                    &emitting_func,
-                    &mut ebreak_args,
-                    true,
-                    None,
-                )?;
+                emit_ffi_call(context, emit_data, &emitting_func, &mut ebreak_args, None)?;
                 if let Some(target_block) = emitting_func.basic_blocks.get(&block.range.end) {
                     emit_data.builder.build_unconditional_branch(*target_block);
                     terminated = true;
