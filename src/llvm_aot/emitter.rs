@@ -211,8 +211,8 @@ impl<'a> EmittingFunc<'a> {
     }
 
     // In case a function contains indirect dispatches, we will emit a special
-    // basic block used to locate the correct basic block after the indirect
-    // dispatch.
+    // basic block used to execute via interpreter and resume to native code as
+    // early as possible.
     pub fn fetch_indirect_dispatcher(
         &mut self,
         context: &'a Context,
@@ -223,43 +223,11 @@ impl<'a> EmittingFunc<'a> {
         }
 
         let i64t = context.i64_type();
-
         let current_block = emit_data.builder.get_insert_block().unwrap();
 
         let dispatch_block = context.append_basic_block(self.value, "indirect_dispatch_block");
         emit_data.builder.position_at_end(dispatch_block);
 
-        let test_value = emit_data.builder.build_load(
-            i64t,
-            self.indirect_dispatcher_alloca,
-            "indirect_dispatch_test_value",
-        );
-
-        let failure_block = context.append_basic_block(self.value, "indirect_jump_failure_block");
-
-        let mut indirect_jump_targets: Vec<(u64, BasicBlock<'a>)> =
-            self.basic_blocks.iter().map(|(a, b)| (*a, *b)).collect();
-        indirect_jump_targets.sort_by_key(|(a, _)| *a);
-        emit_select_control(
-            context,
-            emit_data,
-            self.value,
-            dispatch_block,
-            test_value.into_int_value(),
-            &indirect_jump_targets,
-            failure_block,
-        )?;
-
-        emit_data.builder.position_at_end(failure_block);
-        // When binary search fails to find a basic block to execute, we use the
-        // Rust side interpreter to execute till the next basic block end, then
-        // repeat the binary search process.
-        // TODO: when code is really messy, we might end up in a situation that
-        // the code is jumping back-and-forth between binary search implemented
-        // as LLVM generated code now, and the native Rust side interpreter. An
-        // alternative solution is to move binary search to Rust side. We will need
-        // more studies to know where we shall put the binary search logic. For
-        // now, we leave the original binary search code unchanged here.
         let (interpret_function, data) = emit_env_ffi_function(
             context,
             emit_data,
@@ -269,7 +237,11 @@ impl<'a> EmittingFunc<'a> {
         let mut interpret_args = [
             interpret_function.into(),
             data.into(),
-            i64t.const_int(0, false).into(),
+            self.value
+                .as_global_value()
+                .as_pointer_value()
+                .const_to_int(i64t)
+                .into(),
         ];
         let interpret_result = emit_ffi_call(
             context,
@@ -299,10 +271,18 @@ impl<'a> EmittingFunc<'a> {
             .build_unconditional_branch(self.fetch_ret_block(context, emit_data)?);
 
         emit_data.builder.position_at_end(resume_block);
+        let basic_block_values: Vec<BasicBlock<'a>> =
+            self.basic_blocks.values().map(|value| *value).collect();
+        let target_pointer = emit_data.builder.build_int_to_ptr(
+            interpret_result,
+            // The actual type here does not matter as long as this is
+            // casted to a pointer.
+            i64t.ptr_type(AddressSpace::default()),
+            "interpret_dispatch_pointer",
+        );
         emit_data
             .builder
-            .build_store(self.indirect_dispatcher_alloca, interpret_result);
-        emit_data.builder.build_unconditional_branch(dispatch_block);
+            .build_indirect_branch(target_pointer, &basic_block_values);
 
         emit_data.builder.position_at_end(current_block);
 
@@ -2327,7 +2307,7 @@ fn emit_riscv_func<'a>(
     emit_data: &EmitData<'a>,
     debug_data: &mut Option<DebugData<'a>>,
     func: &Func,
-) -> Result<(), Error> {
+) -> Result<EmittingFunc<'a>, Error> {
     if func.basic_blocks.is_empty() {
         return Err(Error::External(format!(
             "Func {} at 0x{:x} does not have basic blocks!",
@@ -2854,8 +2834,8 @@ fn emit_riscv_func<'a>(
 
         if !terminated {
             debug!(
-                "Control that triggers arbitrary jump: {:?}, block: {:x}",
-                block.control, block.range.start
+                "Control that triggers arbitrary jump: {:?}, block: {:x}-{:x}",
+                block.control, block.range.start, block.range.end
             );
             // Arbitrary jump here. Use interpreter to execute till next basic
             // block end.
@@ -2863,7 +2843,7 @@ fn emit_riscv_func<'a>(
         }
     }
 
-    Ok(())
+    Ok(emitting_func)
 }
 
 // Emit a wrapper function handling environment requirements for calling Rust
@@ -3172,9 +3152,54 @@ fn emit<'a>(
         .add_attribute(AttributeLoc::Function, align_stack_attr);
 
     // Build the actual function bodies
+    let mut basic_block_labels = vec![i64t.const_int(0, false)];
+    let mut functions_with_dispatcher = 0;
     for func in &emit_data.code.funcs {
-        emit_riscv_func(context, emit_data, debug_data, func)?;
+        let emitting_func = emit_riscv_func(context, emit_data, debug_data, func)?;
+        if emitting_func.indirect_dispatcher.is_some() {
+            debug!(
+                "Emitting dispatcher labels for {} {:x}, labels: {}",
+                func.force_name(true),
+                func.range.start,
+                emitting_func.basic_blocks.len()
+            );
+            // Emit basic block labels
+            basic_block_labels.push(i64t.const_int(func.range.start, false));
+            basic_block_labels.push(i64t.const_int(emitting_func.basic_blocks.len() as u64, false));
+            for (riscv_addr, basic_block) in emitting_func.basic_blocks {
+                basic_block_labels.push(i64t.const_int(riscv_addr, false));
+                basic_block_labels.push(
+                    unsafe { basic_block.get_address() }
+                        .ok_or_else(|| {
+                            Error::External(format!(
+                                "Basic block {:x} in func {} does not have block address!",
+                                riscv_addr,
+                                func.force_name(true)
+                            ))
+                        })?
+                        .const_to_int(i64t),
+                );
+            }
+            functions_with_dispatcher += 1;
+        }
     }
+    basic_block_labels[0] = i64t.const_int(functions_with_dispatcher, false);
+
+    let basic_block_table = i64t.const_array(&basic_block_labels);
+    let basic_block_table_type =
+        i64t.array_type(basic_block_labels.len().try_into().map_err(|_e| {
+            Error::External(format!(
+                "There are too many basic block labels provided: {}",
+                basic_block_labels.len(),
+            ))
+        })?);
+    let basic_block_table_var = emit_data.module.add_global(
+        basic_block_table_type,
+        None,
+        &format!("{}____basic_block_table____", emit_data.code.symbol_prefix),
+    );
+    basic_block_table_var.set_alignment(8);
+    basic_block_table_var.set_initializer(&basic_block_table);
 
     emit_entry(context, emit_data)?;
     emit_exit(context, emit_data)?;
@@ -3212,7 +3237,7 @@ fn emit<'a>(
     }
     for func in &emit_data.code.funcs {
         let function = emit_data.emitted_funcs[&func.range.start];
-        if !function.verify(false) {
+        if !function.verify(true) {
             return Err(Error::External(format!(
                 "verifying function {} at 0x{:x}",
                 func.force_name(true),
