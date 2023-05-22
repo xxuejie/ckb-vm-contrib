@@ -34,6 +34,8 @@ pub struct LlvmAotMachine {
     pub code_hash: [u8; 32],
     // Mapping from RISC-V function entry to host function entry
     pub function_mapping: HashMap<u64, u64>,
+    // RISC-V function entry -> RISC-V basic block start -> host basic block start
+    pub indirect_dispatchers: HashMap<u64, HashMap<u64, u64>>,
     pub entry_function: EntryFunctionType,
 
     pub decoder: Decoder,
@@ -46,7 +48,8 @@ pub struct LlvmAotMachineEnv {
     pub ecall: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub ebreak: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
     pub indirect_call: unsafe extern "C" fn(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64,
-    pub arbitrary_jump: unsafe extern "C" fn(m: *mut LlvmAotMachine) -> u64,
+    pub arbitrary_jump:
+        unsafe extern "C" fn(m: *mut LlvmAotMachine, current_func_start: u64) -> u64,
 }
 
 unsafe extern "C" fn bare_ecall(m: *mut LlvmAotMachine) -> u64 {
@@ -87,7 +90,7 @@ unsafe extern "C" fn bare_indirect_call(m: *mut LlvmAotMachine, riscv_addr: u64)
     let m = &mut *m;
     match m.function_mapping.get(&riscv_addr) {
         Some(native_addr) => *native_addr,
-        None => match inner_interpret(m, true) {
+        None => match inner_call(m) {
             Ok(call_end) => call_end,
             Err(e) => {
                 m.bare_call_error = Some(e);
@@ -97,9 +100,21 @@ unsafe extern "C" fn bare_indirect_call(m: *mut LlvmAotMachine, riscv_addr: u64)
     }
 }
 
-unsafe extern "C" fn bare_arbitrary_jump(m: *mut LlvmAotMachine) -> u64 {
+fn inner_call(m: &mut LlvmAotMachine) -> Result<u64, Error> {
+    while m.machine.running() {
+        let instruction = m.step()?;
+
+        if is_ret_instruction(instruction) {
+            return Ok(BARE_FUNC_RETURN);
+        }
+    }
+    // Terminating
+    Ok(BARE_FUNC_ERROR_OR_TERMINATED)
+}
+
+unsafe extern "C" fn bare_arbitrary_jump(m: *mut LlvmAotMachine, current_func_start: u64) -> u64 {
     let mut m = &mut *m;
-    match inner_interpret(&mut m, false) {
+    match inner_interpret(&mut m, current_func_start) {
         Ok(block_end) => block_end,
         Err(e) => {
             m.bare_call_error = Some(e);
@@ -108,21 +123,19 @@ unsafe extern "C" fn bare_arbitrary_jump(m: *mut LlvmAotMachine) -> u64 {
     }
 }
 
-fn inner_interpret(m: &mut LlvmAotMachine, return_on_call: bool) -> Result<u64, Error> {
-    let f = if return_on_call {
-        is_ret_instruction
-    } else {
-        is_basic_block_end_instruction
-    };
-
+fn inner_interpret(m: &mut LlvmAotMachine, current_func_start: u64) -> Result<u64, Error> {
     while m.machine.running() {
         let instruction = m.step()?;
 
-        if f(instruction) {
-            if is_ret_instruction(instruction) {
-                return Ok(BARE_FUNC_RETURN);
-            } else {
-                return Ok(*m.machine.pc());
+        if is_ret_instruction(instruction) {
+            return Ok(BARE_FUNC_RETURN);
+        } else if is_basic_block_end_instruction(instruction) {
+            // Test if current pc is the start of a known basic block,
+            // if so, we can resume execution at native side.
+            if let Some(basic_blocks) = m.indirect_dispatchers.get(&current_func_start) {
+                if let Some(host_addr) = basic_blocks.get(m.machine.pc()) {
+                    return Ok(*host_addr);
+                }
             }
         }
     }
@@ -163,6 +176,16 @@ impl LlvmAotMachine {
             .iter()
             .map(|table| (table.riscv_addr, table.host_addr))
             .collect();
+        let indirect_dispatchers = aot_symbols
+            .dispatchers()
+            .map(|(addr, basic_blocks)| {
+                let basic_blocks: HashMap<u64, u64> = basic_blocks
+                    .into_iter()
+                    .map(|table| (table.riscv_addr, table.host_addr))
+                    .collect();
+                (addr, basic_blocks)
+            })
+            .collect();
 
         let decoder = build_decoder::<u64>(machine.isa(), machine.version());
 
@@ -170,6 +193,7 @@ impl LlvmAotMachine {
             machine,
             code_hash,
             function_mapping,
+            indirect_dispatchers,
             entry_function: aot_symbols.entry_function,
             bare_call_error: None,
             decoder,
