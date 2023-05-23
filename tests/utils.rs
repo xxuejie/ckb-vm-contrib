@@ -64,14 +64,14 @@ pub fn stype_store_op() -> impl Strategy<Value = InstructionOpcode> {
 
 pub fn itype_normal_op() -> impl Strategy<Value = InstructionOpcode> {
     prop::sample::select(vec![
-        opcodes::OP_JALR,
-        opcodes::OP_LB,
-        opcodes::OP_LH,
-        opcodes::OP_LW,
-        opcodes::OP_LD,
-        opcodes::OP_LBU,
-        opcodes::OP_LHU,
-        opcodes::OP_LWU,
+        opcodes::OP_JALR_VERSION1,
+        opcodes::OP_LB_VERSION1,
+        opcodes::OP_LH_VERSION1,
+        opcodes::OP_LW_VERSION1,
+        opcodes::OP_LD_VERSION1,
+        opcodes::OP_LBU_VERSION1,
+        opcodes::OP_LHU_VERSION1,
+        opcodes::OP_LWU_VERSION1,
         opcodes::OP_ADDI,
         opcodes::OP_SLTI,
         opcodes::OP_SLTIU,
@@ -145,6 +145,30 @@ impl<R> VecMemory<R> {
 
 impl<R: Register> Memory for VecMemory<R> {
     type REG = R;
+
+    fn new() -> Self {
+        unreachable!()
+    }
+
+    fn new_with_memory(_memory_size: usize) -> Self {
+        unreachable!()
+    }
+
+    fn memory_size(&self) -> usize {
+        unreachable!()
+    }
+
+    fn load_bytes(&mut self, _addr: u64, _size: u64) -> Result<Bytes, Error> {
+        unreachable!()
+    }
+
+    fn lr(&self) -> &Self::REG {
+        unreachable!()
+    }
+
+    fn set_lr(&mut self, _value: &Self::REG) {
+        unreachable!()
+    }
 
     fn init_pages(
         &mut self,
