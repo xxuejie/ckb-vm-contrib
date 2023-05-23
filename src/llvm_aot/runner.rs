@@ -145,7 +145,7 @@ fn inner_interpret(m: &mut LlvmAotMachine, current_func_start: u64) -> Result<u6
 
 fn is_ret_instruction(i: Instruction) -> bool {
     let opcode = extract_opcode(i);
-    if opcode != insts::OP_JALR {
+    if opcode != insts::OP_JALR_VERSION0 && opcode != insts::OP_JALR_VERSION1 {
         return false;
     }
     let i = Itype(i);
@@ -291,6 +291,7 @@ impl LlvmAotMachine {
 pub struct LlvmAotCoreMachineData {
     pub pc: u64,
     pub memory: *mut u8,
+    pub load_reservation_address: u64,
     pub cycles: u64,
     pub max_cycles: u64,
     pub registers: [u64; RISCV_GENERAL_REGISTER_NUMBER],
@@ -306,6 +307,7 @@ pub struct LlvmAotCoreMachineData {
 pub struct LlvmAotCoreMachine {
     pub data: LlvmAotCoreMachineData,
 
+    pub memory_size: usize,
     pub allocation: Allocation,
     pub cached_region: Option<Region>,
 }
@@ -324,6 +326,7 @@ impl LlvmAotCoreMachine {
         let data = LlvmAotCoreMachineData {
             pc: 0,
             memory: memory.as_mut_ptr(),
+            load_reservation_address: 0,
             cycles: 0,
             max_cycles: 0,
             registers: [0u64; RISCV_GENERAL_REGISTER_NUMBER],
@@ -337,6 +340,7 @@ impl LlvmAotCoreMachine {
 
         Ok(Self {
             data,
+            memory_size,
             allocation: memory,
             cached_region: None,
         })
@@ -449,6 +453,18 @@ impl SupportMachine for LlvmAotCoreMachine {
 impl Memory for LlvmAotCoreMachine {
     type REG = u64;
 
+    fn new() -> Self {
+        unreachable!()
+    }
+
+    fn new_with_memory(_memory_size: usize) -> Self {
+        unreachable!()
+    }
+
+    fn memory_size(&self) -> usize {
+        self.memory_size
+    }
+
     fn init_pages(
         &mut self,
         addr: u64,
@@ -536,6 +552,12 @@ impl Memory for LlvmAotCoreMachine {
         Ok(())
     }
 
+    fn load_bytes(&mut self, addr: u64, size: u64) -> Result<Bytes, Error> {
+        let host_addr = self.data.memory.wrapping_offset(addr as isize);
+        let src = unsafe { from_raw_parts_mut(host_addr, size as usize) };
+        Ok(src.to_vec().into())
+    }
+
     fn store8(&mut self, addr: &Self::REG, value: &Self::REG) -> Result<(), Error> {
         let host_addr = self.data.memory.wrapping_offset(*addr as isize);
         unsafe {
@@ -578,6 +600,14 @@ impl Memory for LlvmAotCoreMachine {
 
     fn clear_flag(&mut self, _page: u64, _flag: u8) -> Result<(), Error> {
         unreachable!()
+    }
+
+    fn lr(&self) -> &Self::REG {
+        &self.data.load_reservation_address
+    }
+
+    fn set_lr(&mut self, value: &Self::REG) {
+        self.data.load_reservation_address = *value;
     }
 }
 

@@ -72,7 +72,7 @@ fn assemble_itype<R: Register>(i: &Itype) -> Option<u16> {
                 );
             }
         }
-        opcodes::OP_LW => {
+        opcodes::OP_LW_VERSION0 | opcodes::OP_LW_VERSION1 => {
             if is_compact_register(i.rd())
                 && is_compact_register(i.rs1())
                 && in_range(i.immediate_s(), 2, 6, false, true)
@@ -95,7 +95,7 @@ fn assemble_itype<R: Register>(i: &Itype) -> Option<u16> {
                 );
             }
         }
-        opcodes::OP_LD => {
+        opcodes::OP_LD_VERSION0 | opcodes::OP_LD_VERSION1 => {
             if R::BITS > 32
                 && is_compact_register(i.rd())
                 && is_compact_register(i.rs1())
@@ -138,7 +138,7 @@ fn assemble_itype<R: Register>(i: &Itype) -> Option<u16> {
                 );
             }
         }
-        opcodes::OP_JALR => {
+        opcodes::OP_JALR_VERSION0 | opcodes::OP_JALR_VERSION1 => {
             if i.rd() == 0 && i.rs1() != 0 && i.immediate_s() == 0 {
                 // C.JR
                 return Some(funct4(0b100) | full_register(i.rs1(), 7) | op(0b10));

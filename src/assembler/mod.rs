@@ -139,7 +139,9 @@ fn parse_itype(
     stream: &mut InstrStream,
 ) -> Result<TaggedInstruction, Error> {
     // https://github.com/riscv-non-isa/riscv-asm-manual/blob/a9945e1db585abaed594d55ff84e87dd93e21723/riscv-asm.md#-a-listing-of-standard-risc-v-pseudoinstructions
-    if opcode == opcodes::OP_JALR && stream.remaining() == 1 {
+    if (opcode == opcodes::OP_JALR_VERSION0 || opcode == opcodes::OP_JALR_VERSION1)
+        && stream.remaining() == 1
+    {
         let rs1 = stream.next_register()?;
         return Ok(Itype::new_u(opcode, 1, rs1, 0).into());
     }
@@ -484,25 +486,27 @@ fn parse_pseudoinstructions<R: Register>(
         )
         .into()])),
         "jr" => Ok(Some(vec![Itype::new_u(
-            opcodes::OP_JALR,
+            opcodes::OP_JALR_VERSION1,
             0,
             stream.next_register()?,
             0,
         )
         .into()])),
-        "ret" => Ok(Some(vec![Itype::new_u(opcodes::OP_JALR, 0, 1, 0).into()])),
+        "ret" => Ok(Some(vec![
+            Itype::new_u(opcodes::OP_JALR_VERSION1, 0, 1, 0).into()
+        ])),
         "call" => {
             let offset = stream.next_number()? as u32;
             Ok(Some(vec![
                 Utype::new(opcodes::OP_AUIPC, 6, offset >> 12).into(),
-                Itype::new_u(opcodes::OP_JALR, 1, 6, offset & 0xFFF).into(),
+                Itype::new_u(opcodes::OP_JALR_VERSION1, 1, 6, offset & 0xFFF).into(),
             ]))
         }
         "tail" => {
             let offset = stream.next_number()? as u32;
             Ok(Some(vec![
                 Utype::new(opcodes::OP_AUIPC, 6, offset >> 12).into(),
-                Itype::new_u(opcodes::OP_JALR, 0, 6, offset & 0xFFF).into(),
+                Itype::new_u(opcodes::OP_JALR_VERSION1, 0, 6, offset & 0xFFF).into(),
             ]))
         }
         _ => Ok(None),

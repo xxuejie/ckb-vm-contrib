@@ -1327,6 +1327,14 @@ fn emit_value<'a>(
     let i1t = context.bool_type();
 
     match value {
+        Value::Lr => emit_load_from_machine(
+            context,
+            emit_data,
+            machine,
+            offset_of!(LlvmAotCoreMachineData, load_reservation_address),
+            i64t,
+            Some("lr"),
+        ),
         Value::Imm(i) => Ok(i64t.const_int(*i, false)),
         Value::Register(r) => emit_load_reg(context, emit_data, machine, allocas, *r, name),
         Value::Op1(op, val) => {
@@ -2126,10 +2134,21 @@ fn emit_writes<'a>(
 ) -> Result<(), Error> {
     let mut memory_ops = Vec::new();
     let mut register_ops = Vec::new();
+    let mut lr_op = None;
 
     for (i, write) in writes.iter().enumerate() {
         let prefix = format!("{}_write{}", prefix, i);
         match write {
+            Write::Lr { value } => {
+                let value = emit_value(
+                    context,
+                    emit_data,
+                    emitting_func,
+                    value,
+                    Some(&format!("{}_value", prefix)),
+                )?;
+                lr_op = Some(value);
+            }
             Write::Memory {
                 address,
                 size,
@@ -2184,6 +2203,17 @@ fn emit_writes<'a>(
             &format!("{}_real_addr", prefix),
         );
         emit_data.builder.build_store(real_address, value);
+    }
+    if let Some(value) = lr_op {
+        emit_store_to_machine(
+            context,
+            emit_data,
+            emitting_func.machine,
+            value,
+            offset_of!(LlvmAotCoreMachineData, load_reservation_address),
+            context.i64_type(),
+            Some("lr"),
+        )?;
     }
     for (index, value) in register_ops {
         emit_store_reg(
