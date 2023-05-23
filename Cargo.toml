@@ -18,7 +18,8 @@ llvm-aot = [
   "rustc-demangle",
   "blake3",
   "libc",
-  "paste"
+  "paste",
+  "rust-lapper"
 ]
 probes = ["probe"]
 
@@ -40,6 +41,7 @@ rustc-demangle = { version = "0.1", optional = true }
 libc = { version = "0.2.132", optional = true }
 paste = { version = "1.0", optional = true }
 probe = { version = "0.5.0", optional = true }
+rust-lapper = { version = "1.1.0", optional = true }
 
 [dev-dependencies]
 proptest = "1.0.0"

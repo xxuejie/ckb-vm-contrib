@@ -17,8 +17,9 @@ use ckb_vm::{
 use core::ops::Range;
 use goblin::elf::{program_header::PT_LOAD, section_header::SHF_EXECINSTR, sym::STT_FUNC, Elf};
 use log::debug;
+use rust_lapper::{Interval, Lapper};
 use rustc_demangle::demangle;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub struct BasicBlock {
@@ -102,13 +103,16 @@ pub fn preprocess(
     let func_addresses = funcs.iter().map(|f| f.range.start).collect();
 
     for func in &mut funcs {
-        let blocks = extract_basic_blocks(
+        let mut blocks = extract_basic_blocks(
             func,
             &mut memory,
             &mut decoder,
             &func_addresses,
             instruction_cycle_func,
         )?;
+        for block in &mut blocks {
+            build_memory_hints(block);
+        }
         func.basic_blocks = blocks;
     }
 
@@ -602,4 +606,195 @@ fn end_with_tail_call(
         }
     }
     None
+}
+
+struct MemoryRange {
+    lapper: Lapper<u64, ()>,
+    batch_index: usize,
+    register: usize,
+}
+
+impl MemoryRange {
+    fn new(batch_index: usize, register: usize) -> Self {
+        Self {
+            lapper: Lapper::new(vec![]),
+            batch_index,
+            register,
+        }
+    }
+
+    fn insert(&mut self, offset: u64, size: u64) {
+        self.lapper.insert(Interval {
+            start: offset,
+            stop: offset + size,
+            val: (),
+        });
+    }
+}
+
+#[derive(Default)]
+struct MemoryMerger {
+    sealed_ranges: Vec<MemoryRange>,
+    opened_ranges: HashMap<usize, MemoryRange>,
+}
+
+impl MemoryMerger {
+    fn open(&mut self, batch_index: usize, reg: usize) -> &mut MemoryRange {
+        self.opened_ranges
+            .entry(reg)
+            .or_insert_with(|| MemoryRange::new(batch_index, reg))
+    }
+
+    fn seal(&mut self, reg: usize) {
+        if let Some(range) = self.opened_ranges.remove(&reg) {
+            self.sealed_ranges.push(range);
+        }
+    }
+
+    fn seal_remaining(mut self) -> Vec<MemoryRange> {
+        let ranges = self.opened_ranges.drain().map(|(_, r)| r);
+        self.sealed_ranges.extend(ranges);
+        for range in &mut self.sealed_ranges {
+            range.lapper.merge_overlaps();
+        }
+        self.sealed_ranges
+    }
+}
+
+fn extract_register_n_offset(value: &Value) -> Option<(usize, u64)> {
+    if let Value::Op2(ActionOp2::Add, lhs, rhs) = value {
+        match (&**lhs, &**rhs) {
+            (Value::Register(reg), Value::Imm(imm)) => {
+                return Some((*reg, *imm));
+            }
+            (Value::Imm(imm), Value::Register(reg)) => {
+                return Some((*reg, *imm));
+            }
+            _ => (),
+        }
+    }
+    None
+}
+
+fn recursively_extracting_load(value: &Value, results: &mut Vec<(usize, u64, u64)>) {
+    match value {
+        Value::Load(v, size) => {
+            if let Value::Register(reg) = &**v {
+                results.push((*reg, 0, *size as u64));
+            } else if let Some((reg, offset)) = extract_register_n_offset(&**v) {
+                results.push((reg, offset, *size as u64));
+            }
+        }
+        Value::Op1(_, v) => {
+            recursively_extracting_load(&**v, results);
+        }
+        Value::Op2(_, lhs, rhs) => {
+            recursively_extracting_load(&**lhs, results);
+            recursively_extracting_load(&**rhs, results);
+        }
+        Value::SignOp2(_, lhs, rhs, _) => {
+            recursively_extracting_load(&**lhs, results);
+            recursively_extracting_load(&**rhs, results);
+        }
+        Value::Cond(c, t, f) => {
+            recursively_extracting_load(&**c, results);
+            recursively_extracting_load(&**t, results);
+            recursively_extracting_load(&**f, results);
+        }
+        _ => (),
+    }
+}
+
+fn extract_memory_loads(writes: &[Write]) -> Vec<(usize, u64, u64)> {
+    let mut result = Vec::new();
+    for write in writes {
+        match write {
+            Write::Lr { value } => {
+                recursively_extracting_load(value, &mut result);
+            }
+            Write::Memory { value, .. } => {
+                recursively_extracting_load(value, &mut result);
+            }
+            Write::Register { value, .. } => {
+                recursively_extracting_load(value, &mut result);
+            }
+            _ => (),
+        }
+    }
+    result
+}
+
+fn extract_memory_writes(writes: &[Write]) -> Vec<(usize, u64, u64)> {
+    let mut result = Vec::new();
+    for write in writes {
+        match write {
+            Write::Memory { address, size, .. } => {
+                if let Some((reg, offset)) = extract_register_n_offset(address) {
+                    result.push((reg, offset, *size as u64));
+                }
+            }
+            _ => (),
+        }
+    }
+    result
+}
+
+fn extract_register_writes(writes: &[Write]) -> HashSet<usize> {
+    let mut result = HashSet::default();
+    for write in writes {
+        match write {
+            Write::Register { index, .. } => {
+                result.insert(*index);
+            }
+            _ => (),
+        };
+    }
+    result
+}
+
+fn build_memory_hints(basic_block: &mut BasicBlock) {
+    let mut read_merger = MemoryMerger::default();
+    let mut write_merger = MemoryMerger::default();
+
+    for (i, batch) in basic_block.write_batches.iter().enumerate() {
+        for (reg, offset, size) in extract_memory_loads(batch) {
+            read_merger.open(i, reg).insert(offset, size);
+        }
+        for (reg, offset, size) in extract_memory_writes(batch) {
+            write_merger.open(i, reg).insert(offset, size);
+        }
+        // Since each write batch is considered to be atomic, we will
+        // only seal ranges after all register reads are performed.
+        for reg in extract_register_writes(batch) {
+            read_merger.seal(reg);
+            write_merger.seal(reg);
+        }
+    }
+
+    for range in read_merger.seal_remaining() {
+        for interval in range.lapper.iter() {
+            basic_block.write_batches[range.batch_index].insert(
+                0,
+                Write::Hint {
+                    reg: range.register,
+                    offset: interval.start,
+                    size: interval.stop - interval.start,
+                    write: false,
+                },
+            );
+        }
+    }
+    for range in write_merger.seal_remaining() {
+        for interval in range.lapper.iter() {
+            basic_block.write_batches[range.batch_index].insert(
+                0,
+                Write::Hint {
+                    reg: range.register,
+                    offset: interval.start,
+                    size: interval.stop - interval.start,
+                    write: true,
+                },
+            );
+        }
+    }
 }

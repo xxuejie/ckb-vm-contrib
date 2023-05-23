@@ -2139,6 +2139,8 @@ fn emit_writes<'a>(
     for (i, write) in writes.iter().enumerate() {
         let prefix = format!("{}_write{}", prefix, i);
         match write {
+            // Deal with memory hints later
+            Write::Hint { .. } => (),
             Write::Lr { value } => {
                 let value = emit_value(
                     context,
