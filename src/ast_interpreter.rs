@@ -9,6 +9,7 @@ pub const PC_INDEX: usize = 0xFFFF;
 /// helpful in terms of debugging.
 pub fn interpret<Mac: Machine>(value: &Value, machine: &mut Mac) -> Result<Mac::REG, Error> {
     match value {
+        Value::Lr => Ok(machine.memory_mut().lr().clone()),
         Value::Imm(imm) => Ok(Mac::REG::from_u64(*imm)),
         Value::Register(index) => {
             if *index < RISCV_GENERAL_REGISTER_NUMBER {

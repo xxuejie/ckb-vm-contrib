@@ -12,6 +12,9 @@ use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub enum Write {
+    Lr {
+        value: Value,
+    },
     Memory {
         address: Value,
         size: u8,
@@ -38,6 +41,7 @@ impl Write {
 impl fmt::Display for Write {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Write::Lr { value } => write!(f, "Lr = {}", PrettyValue::new(value),),
             Write::Memory {
                 address,
                 size,
@@ -248,6 +252,14 @@ impl Machine for AstMachine {
 impl Memory for AstMachine {
     type REG = Value;
 
+    fn new() -> Self {
+        unreachable!()
+    }
+
+    fn new_with_memory(_memory_size: usize) -> Self {
+        unreachable!()
+    }
+
     fn init_pages(
         &mut self,
         _addr: u64,
@@ -271,11 +283,19 @@ impl Memory for AstMachine {
         unreachable!()
     }
 
+    fn memory_size(&self) -> usize {
+        unreachable!()
+    }
+
     fn store_byte(&mut self, _addr: u64, _size: u64, _value: u8) -> Result<(), Error> {
         unreachable!()
     }
 
     fn store_bytes(&mut self, _addr: u64, _value: &[u8]) -> Result<(), Error> {
+        unreachable!()
+    }
+
+    fn load_bytes(&mut self, _addr: u64, _size: u64) -> Result<Bytes, Error> {
         unreachable!()
     }
 
@@ -338,6 +358,16 @@ impl Memory for AstMachine {
         });
         Ok(())
     }
+
+    fn lr(&self) -> &Value {
+        &Value::Lr
+    }
+
+    fn set_lr(&mut self, value: &Value) {
+        self.memory_writes.push(Write::Lr {
+            value: value.clone(),
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -366,6 +396,7 @@ fn infix_action_op2(op: &ActionOp2) -> Option<&'static str> {
 impl fmt::Display for PrettyValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &*self.0 {
+            Value::Lr => write!(f, "Lr"),
             Value::Imm(i) => write!(f, "0x{:x}", i),
             Value::Register(r) => write!(f, "Reg({})", register_names(*r)),
             Value::Op1(op, v) => write!(f, "Op1({:?}, {})", op, PrettyValue(v.clone())),

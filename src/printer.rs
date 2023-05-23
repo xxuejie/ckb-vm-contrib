@@ -25,6 +25,7 @@ impl InstructionPrinter {
             TaggedInstruction::Stype(i) => i.0,
             TaggedInstruction::Utype(i) => i.0,
             TaggedInstruction::R4type(i) => i.0,
+            TaggedInstruction::R5type(i) => i.0,
         }
     }
 }
@@ -163,7 +164,14 @@ impl fmt::Display for InstructionPrinter {
                     return write!(f, "jal {}", i.immediate_s());
                 }
             }
-            (opcodes::OP_JALR, TaggedInstruction::Itype(i)) => {
+            (opcodes::OP_JALR_VERSION0, TaggedInstruction::Itype(i)) => {
+                if i.rd() == 0 && i.rs1() == 1 && i.immediate_u() == 0 {
+                    return write!(f, "ret");
+                } else if i.rd() == 1 && i.immediate_u() == 0 {
+                    return write!(f, "jalr {}", register_name(i.rs1()));
+                }
+            }
+            (opcodes::OP_JALR_VERSION1, TaggedInstruction::Itype(i)) => {
                 if i.rd() == 0 && i.rs1() == 1 && i.immediate_u() == 0 {
                     return write!(f, "ret");
                 } else if i.rd() == 1 && i.immediate_u() == 0 {
@@ -184,7 +192,10 @@ impl fmt::Display for InstructionPrinter {
             }
             _ => (),
         };
-        self.0.fmt(f)
+        let text = format!("{}", self.0)
+            .replace("_version0", "")
+            .replace("_version1", "");
+        write!(f, "{}", text)
     }
 }
 

@@ -18,13 +18,27 @@ pub fn assembler<R: Register>(inst: &TaggedInstruction) -> Option<Vec<u8>> {
 
 fn assemble_itype<R: Register>(i: &Itype) -> Option<u32> {
     match i.op() {
-        opcodes::OP_LB => Some(funct3(0b000) | opcode(0b0000011)),
-        opcodes::OP_LH => Some(funct3(0b001) | opcode(0b0000011)),
-        opcodes::OP_LW => Some(funct3(0b010) | opcode(0b0000011)),
-        opcodes::OP_LD => Some(funct3(0b011) | opcode(0b0000011)),
-        opcodes::OP_LBU => Some(funct3(0b100) | opcode(0b0000011)),
-        opcodes::OP_LHU => Some(funct3(0b101) | opcode(0b0000011)),
-        opcodes::OP_LWU => Some(funct3(0b110) | opcode(0b0000011)),
+        opcodes::OP_LB_VERSION0 | opcodes::OP_LB_VERSION1 => {
+            Some(funct3(0b000) | opcode(0b0000011))
+        }
+        opcodes::OP_LH_VERSION0 | opcodes::OP_LH_VERSION1 => {
+            Some(funct3(0b001) | opcode(0b0000011))
+        }
+        opcodes::OP_LW_VERSION0 | opcodes::OP_LW_VERSION1 => {
+            Some(funct3(0b010) | opcode(0b0000011))
+        }
+        opcodes::OP_LD_VERSION0 | opcodes::OP_LD_VERSION1 => {
+            Some(funct3(0b011) | opcode(0b0000011))
+        }
+        opcodes::OP_LBU_VERSION0 | opcodes::OP_LBU_VERSION1 => {
+            Some(funct3(0b100) | opcode(0b0000011))
+        }
+        opcodes::OP_LHU_VERSION0 | opcodes::OP_LHU_VERSION1 => {
+            Some(funct3(0b101) | opcode(0b0000011))
+        }
+        opcodes::OP_LWU_VERSION0 | opcodes::OP_LWU_VERSION1 => {
+            Some(funct3(0b110) | opcode(0b0000011))
+        }
         opcodes::OP_ADDI => Some(funct3(0b000) | opcode(0b0010011)),
         opcodes::OP_SLTI => Some(funct3(0b010) | opcode(0b0010011)),
         opcodes::OP_SLTIU => Some(funct3(0b011) | opcode(0b0010011)),
@@ -32,7 +46,9 @@ fn assemble_itype<R: Register>(i: &Itype) -> Option<u32> {
         opcodes::OP_ORI => Some(funct3(0b110) | opcode(0b0010011)),
         opcodes::OP_ANDI => Some(funct3(0b111) | opcode(0b0010011)),
         opcodes::OP_ADDIW => Some(funct3(0b000) | opcode(0b0011011)),
-        opcodes::OP_JALR => Some(funct3(0b000) | opcode(0b1100111)),
+        opcodes::OP_JALR_VERSION0 | opcodes::OP_JALR_VERSION1 => {
+            Some(funct3(0b000) | opcode(0b1100111))
+        }
         _ => None,
     }
     .map(|packed| packed | itype_immediate(i.immediate_s()) | rs1(i.rs1()) | rd(i.rd()))

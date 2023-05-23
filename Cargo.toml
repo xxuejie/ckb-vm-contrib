@@ -23,7 +23,8 @@ llvm-aot = [
 probes = ["probe"]
 
 [dependencies]
-ckb-vm = "0.23.1"
+# ckb-vm = "0.24.0"
+ckb-vm = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "bac62f8" }
 goblin = "=0.4.0"
 lazy_static = "1.4.0"
 log = "0.4.17"
