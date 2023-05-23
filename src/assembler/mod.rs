@@ -114,7 +114,13 @@ lazy_static! {
         }
 
         for op in opcodes::OP_UNLOADED..=opcodes::OP_CUSTOM_TRACE_END {
-            let name = instruction_opcode_name(op).to_lowercase().to_string();
+            let mut name = instruction_opcode_name(op).to_lowercase().to_string();
+            // Only latest version is supported here
+            if name.ends_with("_version0") {
+                continue;
+            } else if name.ends_with("_version1") {
+                name = name.replace("_version1", "");
+            }
             if !m.contains_key(&name) {
                 let f = match TaggedInstruction::try_from(blank_instruction(op)) {
                     Ok(TaggedInstruction::Rtype(_)) => Some(parse_rtype as ParserFunc),

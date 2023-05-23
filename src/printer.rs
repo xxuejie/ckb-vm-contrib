@@ -192,7 +192,10 @@ impl fmt::Display for InstructionPrinter {
             }
             _ => (),
         };
-        self.0.fmt(f)
+        let text = format!("{}", self.0)
+            .replace("_version0", "")
+            .replace("_version1", "");
+        write!(f, "{}", text)
     }
 }
 
