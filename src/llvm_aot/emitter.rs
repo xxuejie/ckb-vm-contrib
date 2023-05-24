@@ -248,6 +248,7 @@ impl<'a> EmittingFunc<'a> {
             emit_data,
             self,
             &mut interpret_args,
+            true,
             Some("interpret_function_result"),
         )?;
 
@@ -1257,15 +1258,18 @@ fn emit_ffi_call<'a>(
     emit_data: &EmitData<'a>,
     emitting_func: &EmittingFunc<'a>,
     args: &[BasicMetadataValueEnum<'a>; 3],
+    side_effect: bool,
     name: Option<&str>,
 ) -> Result<IntValue<'a>, Error> {
     let name = name.unwrap_or("ffi_call_result");
 
-    emit_cleanup(
-        context,
-        emit_data,
-        &emitting_func.allocas.load_values(emit_data)?,
-    )?;
+    if side_effect {
+        emit_cleanup(
+            context,
+            emit_data,
+            &emitting_func.allocas.load_values(emit_data)?,
+        )?;
+    }
 
     let result = emit_data
         .builder
@@ -1274,10 +1278,12 @@ fn emit_ffi_call<'a>(
         .unwrap_left()
         .into_int_value();
 
-    emitting_func.allocas.store_values(
-        emit_data,
-        &emit_setup(context, emit_data, emitting_func.machine)?,
-    )?;
+    if side_effect {
+        emitting_func.allocas.store_values(
+            emit_data,
+            &emit_setup(context, emit_data, emitting_func.machine)?,
+        )?;
+    }
 
     let success_block =
         context.append_basic_block(emitting_func.value, &format!("{}_success_block", name));
@@ -2629,6 +2635,7 @@ fn emit_riscv_func<'a>(
                     emit_data,
                     &emitting_func,
                     &mut call_args,
+                    true,
                     Some("call_function_result"),
                 )?;
                 // There might be 3 cases here:
@@ -2722,7 +2729,14 @@ fn emit_riscv_func<'a>(
                     data.into(),
                     i64t.const_int(0, false).into(),
                 ];
-                emit_ffi_call(context, emit_data, &emitting_func, &mut ecall_args, None)?;
+                emit_ffi_call(
+                    context,
+                    emit_data,
+                    &emitting_func,
+                    &mut ecall_args,
+                    true,
+                    None,
+                )?;
                 if let Some(target_block) = emitting_func.basic_blocks.get(&block.range.end) {
                     emit_data.builder.build_unconditional_branch(*target_block);
                 } else {
@@ -2753,7 +2767,14 @@ fn emit_riscv_func<'a>(
                     data.into(),
                     i64t.const_int(0, false).into(),
                 ];
-                emit_ffi_call(context, emit_data, &emitting_func, &mut ebreak_args, None)?;
+                emit_ffi_call(
+                    context,
+                    emit_data,
+                    &emitting_func,
+                    &mut ebreak_args,
+                    true,
+                    None,
+                )?;
                 if let Some(target_block) = emitting_func.basic_blocks.get(&block.range.end) {
                     emit_data.builder.build_unconditional_branch(*target_block);
                     terminated = true;
