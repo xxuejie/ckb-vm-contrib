@@ -56,7 +56,7 @@ impl fmt::Display for Write {
                 let prefix = if *write { "Write" } else { "Read" };
                 write!(
                     f,
-                    "{}Hint: Reg({} + 0x{:x}), size: 0x{:x}",
+                    "{}Hint: Reg({}) + 0x{:x}, size: 0x{:x}",
                     prefix,
                     register_names(*reg),
                     offset,
@@ -208,7 +208,14 @@ impl AstMachine {
     }
 
     pub fn reset_registers(&mut self) {
-        self.registers = init_registers();
+        for (i, default_value) in init_registers().into_iter().enumerate() {
+            if let Value::Imm(_) = self.registers[i] {
+                // Keep immediates for simplification of code
+                ()
+            } else {
+                self.registers[i] = default_value;
+            }
+        }
     }
 }
 
@@ -512,6 +519,7 @@ pub fn simplify(value: &Value) -> Value {
                 }
                 (Value::Imm(0), r) => return r.clone(),
                 (r, Value::Imm(0)) => return r.clone(),
+                (Value::Imm(l), Value::Imm(r)) => return Value::Imm(l.wrapping_add(*r)),
                 _ => (),
             };
             value.clone()
