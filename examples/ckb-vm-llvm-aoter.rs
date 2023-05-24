@@ -271,7 +271,7 @@ fn dump_control(o: &mut Box<dyn Write>, control: &Control, funcs: &[Func]) -> Re
     match control {
         Control::Call { address, .. } => {
             if let Some(func) = funcs.iter().find(|f| f.range.start == *address) {
-                write!(o, "    {} ({})", control, func.force_name(true))?;
+                write!(o, "    {} ({})\n", control, func.force_name(true))?;
                 return Ok(());
             }
         }
