@@ -634,10 +634,11 @@ impl MemoryRange {
         }
     }
 
-    fn insert(&mut self, offset: u64, size: u64) {
+    fn insert(&mut self, offset: u64, offset2: u64, size: u64) {
+        let offset: u128 = offset as u128 + offset2 as u128;
         self.lapper.insert(Interval {
-            start: offset as u128,
-            stop: offset as u128 + size as u128,
+            start: offset,
+            stop: offset + size as u128,
             val: (),
         });
     }
@@ -695,7 +696,7 @@ impl MemoryMerger {
             .or_insert_with(|| {
                 MemoryRange::new(std::cmp::min(batch_index, real_batch_start), real_reg)
             })
-            .insert(offset.wrapping_add(additional_offset), size);
+            .insert(offset, additional_offset, size);
     }
 
     fn seal(&mut self, batch_index: usize, writes: &HashMap<usize, Value>) {
