@@ -25,7 +25,7 @@ probes = ["probe"]
 
 [dependencies]
 # ckb-vm = "0.24.0"
-ckb-vm = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "bac62f8" }
+ckb-vm = { git = "https://github.com/nervosnetwork/ckb-vm", rev = "5020684" }
 goblin = "=0.4.0"
 lazy_static = "1.4.0"
 log = "0.4.17"

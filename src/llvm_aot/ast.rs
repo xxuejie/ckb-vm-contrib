@@ -399,6 +399,22 @@ impl Memory for AstMachine {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ExternalType {
+    UnhintedLoad = 1,
+}
+
+impl TryFrom<u64> for ExternalType {
+    type Error = ();
+
+    fn try_from(v: u64) -> Result<Self, Self::Error> {
+        match v {
+            x if x == ExternalType::UnhintedLoad as u64 => Ok(ExternalType::UnhintedLoad),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PrettyValue(pub Rc<Value>);
 
@@ -464,6 +480,16 @@ impl fmt::Display for PrettyValue {
                 PrettyValue(v2.clone()),
             ),
             Value::Load(v, s) => write!(f, "Load({}, {})", PrettyValue(v.clone()), s,),
+            Value::External(v, t) => {
+                write!(
+                    f,
+                    "External[{}]({})",
+                    (*t).try_into()
+                        .map(|e: ExternalType| format!("{:?}", e))
+                        .unwrap_or("UNKNOWN".to_string()),
+                    v,
+                )
+            }
         }
     }
 }

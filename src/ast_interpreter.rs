@@ -51,6 +51,7 @@ pub fn interpret<Mac: Machine>(value: &Value, machine: &mut Mac) -> Result<Mac::
                 _ => Err(Error::External(format!("Invalid load size: {}", size))),
             }
         }
+        Value::External(value, _) => interpret(value, machine),
     }
 }
 

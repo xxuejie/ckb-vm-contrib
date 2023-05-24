@@ -1,6 +1,6 @@
 use super::{
     super::printer::InstructionPrinter,
-    ast::{simplify, simplify_with_writes, AstMachine, Control, Write},
+    ast::{simplify, simplify_with_writes, AstMachine, Control, ExternalType, Write},
     AOT_ISA, AOT_VERSION,
 };
 use crate::decoder::AuxDecoder;
@@ -730,40 +730,73 @@ fn extract_register_n_offset(value: &Value) -> Option<(usize, u64)> {
     None
 }
 
-fn recursively_extracting_load(value: &Value, results: &mut Vec<(usize, u64, u64)>) {
+fn recursively_extracting_load(value: &mut Value, results: &mut Vec<(usize, u64, u64)>) -> bool {
     match value {
         Value::Load(v, size) => {
             if let Value::Register(reg) = &**v {
                 results.push((*reg, 0, *size as u64));
+                false
             } else if let Value::Imm(imm) = &**v {
                 results.push((0, *imm, *size as u64));
+                false
             } else if let Some((reg, offset)) = extract_register_n_offset(&**v) {
                 results.push((reg, offset, *size as u64));
+                false
+            } else {
+                // When a load cannot be covered by hint, wrap it with UnhintedLoad
+                // so as to inform the emitter
+                *value = Value::External(value.clone().into(), ExternalType::UnhintedLoad as u64);
+                true
             }
-            // TODO: we will need a way to distinguish between hinted
-            // loads and unhinted loads
         }
-        Value::Op1(_, v) => {
-            recursively_extracting_load(&**v, results);
+        Value::Op1(op, v) => {
+            let mut v2 = (&**v).clone();
+            let changed = recursively_extracting_load(&mut v2, results);
+            if changed {
+                *value = Value::Op1(*op, v2.into());
+            }
+            changed
         }
-        Value::Op2(_, lhs, rhs) => {
-            recursively_extracting_load(&**lhs, results);
-            recursively_extracting_load(&**rhs, results);
+        Value::Op2(op, lhs, rhs) => {
+            let mut lhs2 = (&**lhs).clone();
+            let lhs_changed = recursively_extracting_load(&mut lhs2, results);
+            let mut rhs2 = (&**rhs).clone();
+            let rhs_changed = recursively_extracting_load(&mut rhs2, results);
+            let changed = lhs_changed || rhs_changed;
+            if changed {
+                *value = Value::Op2(*op, lhs2.into(), rhs2.into());
+            }
+            changed
         }
-        Value::SignOp2(_, lhs, rhs, _) => {
-            recursively_extracting_load(&**lhs, results);
-            recursively_extracting_load(&**rhs, results);
+        Value::SignOp2(op, lhs, rhs, sign) => {
+            let mut lhs2 = (&**lhs).clone();
+            let lhs_changed = recursively_extracting_load(&mut lhs2, results);
+            let mut rhs2 = (&**rhs).clone();
+            let rhs_changed = recursively_extracting_load(&mut rhs2, results);
+            let changed = lhs_changed || rhs_changed;
+            if changed {
+                *value = Value::SignOp2(*op, lhs2.into(), rhs2.into(), *sign);
+            }
+            changed
         }
         Value::Cond(c, t, f) => {
-            recursively_extracting_load(&**c, results);
-            recursively_extracting_load(&**t, results);
-            recursively_extracting_load(&**f, results);
+            let mut c2 = (&**c).clone();
+            let c_changed = recursively_extracting_load(&mut c2, results);
+            let mut t2 = (&**t).clone();
+            let t_changed = recursively_extracting_load(&mut t2, results);
+            let mut f2 = (&**f).clone();
+            let f_changed = recursively_extracting_load(&mut f2, results);
+            let changed = c_changed || t_changed || f_changed;
+            if changed {
+                *value = Value::Cond(c2.into(), t2.into(), f2.into());
+            }
+            changed
         }
-        _ => (),
+        _ => false,
     }
 }
 
-fn extract_memory_loads(writes: &[Write]) -> Vec<(usize, u64, u64)> {
+fn extract_memory_loads(writes: &mut [Write]) -> Vec<(usize, u64, u64)> {
     let mut result = Vec::new();
     for write in writes {
         match write {
@@ -814,7 +847,7 @@ fn build_memory_hints(basic_block: &mut BasicBlock) {
     let mut read_merger = MemoryMerger::default();
     let mut write_merger = MemoryMerger::default();
 
-    for (i, batch) in basic_block.write_batches.iter().enumerate() {
+    for (i, batch) in basic_block.write_batches.iter_mut().enumerate() {
         for (reg, offset, size) in extract_memory_loads(batch) {
             read_merger.insert(i, reg, offset, size);
         }

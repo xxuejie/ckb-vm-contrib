@@ -1333,6 +1333,10 @@ fn emit_value<'a>(
     let i1t = context.bool_type();
 
     match value {
+        Value::External(val, _) => {
+            // TODO: handle unhinted load here
+            emit_value(context, emit_data, emitting_func, &*val, Some("external"))
+        }
         Value::Lr => emit_load_from_machine(
             context,
             emit_data,
