@@ -700,19 +700,30 @@ impl MemoryMerger {
     }
 
     fn seal(&mut self, batch_index: usize, writes: &HashMap<usize, Value>) {
-        let mut seals = vec![];
         for (reg, value) in writes {
             if let Some((real_reg, offset)) = extract_register_n_offset(&simplify(value)) {
-                let real_batch_start = self.valid_batch_start.get(&real_reg).cloned().unwrap_or(0);
+                // Nested simplifying, since writes are iteratively processed,
+                // loops are not needed here.
+                let (real_reg, real_batch_start, offset) = if let Some((
+                    a_reg,
+                    a_batch_start,
+                    a_offset,
+                )) = self.virtual_regs.get(&real_reg)
+                {
+                    // TODO: is wrapping_add correct here?
+                    (*a_reg, *a_batch_start, a_offset.wrapping_add(offset))
+                } else {
+                    let real_batch_start =
+                        self.valid_batch_start.get(&real_reg).cloned().unwrap_or(0);
+                    (real_reg, real_batch_start, offset)
+                };
                 self.virtual_regs
                     .insert(*reg, (real_reg, real_batch_start, offset));
-            } else {
-                seals.push(*reg);
             }
         }
         // Make sure each write batch is processed atomically
-        for reg in seals {
-            self.valid_batch_start.insert(reg, batch_index + 1);
+        for (reg, _) in writes {
+            self.valid_batch_start.insert(*reg, batch_index + 1);
         }
     }
 
