@@ -505,34 +505,45 @@ fn parse_basic_block<M: Memory>(
         &write_batches.iter().flatten().collect::<Vec<&Write>>(),
     );
     let last_writes = ast_machine.take_writes();
-    let control = match ast_machine.take_control() {
-        Some(Control::Ecall { .. }) => Control::Ecall { pc: last_pc },
-        Some(Control::Ebreak { .. }) => Control::Ebreak { pc: last_pc },
-        _ => {
-            if let Some(callee) = end_with_call(block_end, &last_pc, &last_writes, func_addresses) {
-                Control::Call {
-                    address: callee,
-                    writes: last_writes,
-                }
-            } else if end_with_possible_indirect_call(block_end, &last_pc, &last_writes) {
-                Control::IndirectCall {
-                    pc: last_pc,
-                    writes: last_writes,
-                }
-            } else if let Some(callee) = end_with_tail_call(&last_pc, &last_writes, func_addresses)
-            {
-                Control::Tailcall { address: callee }
-            } else if is_possible_return(&last_pc) {
-                Control::Return {
-                    pc: last_pc,
-                    writes: last_writes,
-                }
-            } else {
-                Control::Jump {
-                    pc: last_pc,
-                    writes: last_writes,
+    let control = if is_basic_block_end_instruction(last_inst) {
+        match ast_machine.take_control() {
+            Some(Control::Ecall { .. }) => Control::Ecall { pc: last_pc },
+            Some(Control::Ebreak { .. }) => Control::Ebreak { pc: last_pc },
+            _ => {
+                if let Some(callee) =
+                    end_with_call(block_end, &last_pc, &last_writes, func_addresses)
+                {
+                    Control::Call {
+                        address: callee,
+                        writes: last_writes,
+                    }
+                } else if end_with_possible_indirect_call(block_end, &last_pc, &last_writes) {
+                    Control::IndirectCall {
+                        pc: last_pc,
+                        writes: last_writes,
+                    }
+                } else if let Some(callee) =
+                    end_with_tail_call(&last_pc, &last_writes, func_addresses)
+                {
+                    Control::Tailcall { address: callee }
+                } else if is_possible_return(&last_pc) {
+                    Control::Return {
+                        pc: last_pc,
+                        writes: last_writes,
+                    }
+                } else {
+                    Control::Jump {
+                        pc: last_pc,
+                        writes: last_writes,
+                    }
                 }
             }
+        }
+    } else {
+        write_batches.push(last_writes);
+        Control::Jump {
+            pc: last_pc,
+            writes: vec![],
         }
     };
 
