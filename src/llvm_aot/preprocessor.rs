@@ -1,6 +1,6 @@
 use super::{
     super::printer::InstructionPrinter,
-    ast::{simplify_with_writes, AstMachine, Control, Write},
+    ast::{simplify, simplify_with_writes, AstMachine, Control, Write},
     AOT_ISA, AOT_VERSION,
 };
 use crate::decoder::AuxDecoder;
@@ -609,7 +609,7 @@ fn end_with_tail_call(
 }
 
 struct MemoryRange {
-    lapper: Lapper<u64, ()>,
+    lapper: Lapper<u128, ()>,
     batch_index: usize,
     register: usize,
 }
@@ -625,42 +625,93 @@ impl MemoryRange {
 
     fn insert(&mut self, offset: u64, size: u64) {
         self.lapper.insert(Interval {
-            start: offset,
-            stop: offset + size,
+            start: offset as u128,
+            stop: offset as u128 + size as u128,
             val: (),
         });
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> {
+        self.lapper
+            .iter()
+            .map(|interval| {
+                (
+                    interval.start as u64,
+                    (interval.stop - interval.start) as u64,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
 #[derive(Default)]
 struct MemoryMerger {
-    sealed_ranges: Vec<MemoryRange>,
-    opened_ranges: HashMap<usize, MemoryRange>,
+    // (reg, batch_start) -> MemoryRange
+    ranges: HashMap<(usize, usize), MemoryRange>,
     valid_batch_start: HashMap<usize, usize>,
+    // When we have writes like the following:
+    //
+    // * Register[ a1 ] = (0x8050 + Reg(sp))
+    //
+    // We want hints using a1 as base register can be transformed
+    // into hints using sp directly. Virtual register are used to handle
+    // this in a series of register writes.
+    // Note that one register might also shadow itself:
+    //
+    // * Register[ sp ] = (Reg(sp) + 0xffffffffffffff20)
+    //
+    // One can think of batch_index as a sort of timestamp amongst register writes,
+    // the immediate preceeding batch_start, can be viewed as the "version" for a
+    // particular real register value.
+    //
+    // virtual_reg -> (real_reg, batch_start, additional_offset)
+    virtual_regs: HashMap<usize, (usize, usize, u64)>,
 }
 
 impl MemoryMerger {
-    fn open(&mut self, batch_index: usize, reg: usize) -> &mut MemoryRange {
-        let valid_start = self.valid_batch_start.get(&reg).cloned().unwrap_or(0);
-        self.opened_ranges
-            .entry(reg)
-            .or_insert_with(|| MemoryRange::new(std::cmp::min(batch_index, valid_start), reg))
+    fn insert(&mut self, batch_index: usize, reg: usize, offset: u64, size: u64) {
+        let (real_reg, real_batch_start, additional_offset) = match self.virtual_regs.get(&reg) {
+            Some((reg, batch_start, offset)) => (*reg, *batch_start, *offset),
+            None => (
+                reg,
+                self.valid_batch_start.get(&reg).cloned().unwrap_or(0),
+                0,
+            ),
+        };
+        self.ranges
+            .entry((real_reg, real_batch_start))
+            .or_insert_with(|| {
+                MemoryRange::new(std::cmp::min(batch_index, real_batch_start), real_reg)
+            })
+            .insert(offset.wrapping_add(additional_offset), size);
     }
 
-    fn seal(&mut self, batch_index: usize, reg: usize) {
-        if let Some(range) = self.opened_ranges.remove(&reg) {
-            self.sealed_ranges.push(range);
+    fn seal(&mut self, batch_index: usize, writes: &HashMap<usize, Value>) {
+        let mut seals = vec![];
+        for (reg, value) in writes {
+            if let Some((real_reg, offset)) = extract_register_n_offset(&simplify(value)) {
+                let real_batch_start = self.valid_batch_start.get(&real_reg).cloned().unwrap_or(0);
+                self.virtual_regs
+                    .insert(*reg, (real_reg, real_batch_start, offset));
+            } else {
+                seals.push(*reg);
+            }
         }
-        self.valid_batch_start.insert(reg, batch_index + 1);
+        // Make sure each write batch is processed atomically
+        for reg in seals {
+            self.valid_batch_start.insert(reg, batch_index + 1);
+        }
     }
 
-    fn seal_remaining(mut self) -> Vec<MemoryRange> {
-        let ranges = self.opened_ranges.drain().map(|(_, r)| r);
-        self.sealed_ranges.extend(ranges);
-        for range in &mut self.sealed_ranges {
-            range.lapper.merge_overlaps();
-        }
-        self.sealed_ranges
+    fn finish(mut self) -> Vec<MemoryRange> {
+        self.ranges
+            .drain()
+            .map(|(_, mut r)| {
+                r.lapper.merge_overlaps();
+                r
+            })
+            .collect()
     }
 }
 
@@ -684,9 +735,13 @@ fn recursively_extracting_load(value: &Value, results: &mut Vec<(usize, u64, u64
         Value::Load(v, size) => {
             if let Value::Register(reg) = &**v {
                 results.push((*reg, 0, *size as u64));
+            } else if let Value::Imm(imm) = &**v {
+                results.push((0, *imm, *size as u64));
             } else if let Some((reg, offset)) = extract_register_n_offset(&**v) {
                 results.push((reg, offset, *size as u64));
             }
+            // TODO: we will need a way to distinguish between hinted
+            // loads and unhinted loads
         }
         Value::Op1(_, v) => {
             recursively_extracting_load(&**v, results);
@@ -742,12 +797,12 @@ fn extract_memory_writes(writes: &[Write]) -> Vec<(usize, u64, u64)> {
     result
 }
 
-fn extract_register_writes(writes: &[Write]) -> HashSet<usize> {
-    let mut result = HashSet::default();
+fn extract_register_writes(writes: &[Write]) -> HashMap<usize, Value> {
+    let mut result = HashMap::default();
     for write in writes {
         match write {
-            Write::Register { index, .. } => {
-                result.insert(*index);
+            Write::Register { index, value } => {
+                result.insert(*index, value.clone());
             }
             _ => (),
         };
@@ -761,40 +816,39 @@ fn build_memory_hints(basic_block: &mut BasicBlock) {
 
     for (i, batch) in basic_block.write_batches.iter().enumerate() {
         for (reg, offset, size) in extract_memory_loads(batch) {
-            read_merger.open(i, reg).insert(offset, size);
+            read_merger.insert(i, reg, offset, size);
         }
         for (reg, offset, size) in extract_memory_writes(batch) {
-            write_merger.open(i, reg).insert(offset, size);
+            write_merger.insert(i, reg, offset, size);
         }
         // Since each write batch is considered to be atomic, we will
         // only seal ranges after all register reads are performed.
-        for reg in extract_register_writes(batch) {
-            read_merger.seal(i, reg);
-            write_merger.seal(i, reg);
-        }
+        let register_writes = extract_register_writes(batch);
+        read_merger.seal(i, &register_writes);
+        write_merger.seal(i, &register_writes);
     }
 
-    for range in read_merger.seal_remaining() {
-        for interval in range.lapper.iter() {
+    for range in read_merger.finish() {
+        for (offset, size) in range.iter() {
             basic_block.write_batches[range.batch_index].insert(
                 0,
                 Write::Hint {
                     reg: range.register,
-                    offset: interval.start,
-                    size: interval.stop - interval.start,
+                    offset,
+                    size,
                     write: false,
                 },
             );
         }
     }
-    for range in write_merger.seal_remaining() {
-        for interval in range.lapper.iter() {
+    for range in write_merger.finish() {
+        for (offset, size) in range.iter() {
             basic_block.write_batches[range.batch_index].insert(
                 0,
                 Write::Hint {
                     reg: range.register,
-                    offset: interval.start,
-                    size: interval.stop - interval.start,
+                    offset,
+                    size,
                     write: true,
                 },
             );
