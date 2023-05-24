@@ -636,19 +636,22 @@ impl MemoryRange {
 struct MemoryMerger {
     sealed_ranges: Vec<MemoryRange>,
     opened_ranges: HashMap<usize, MemoryRange>,
+    valid_batch_start: HashMap<usize, usize>,
 }
 
 impl MemoryMerger {
     fn open(&mut self, batch_index: usize, reg: usize) -> &mut MemoryRange {
+        let valid_start = self.valid_batch_start.get(&reg).cloned().unwrap_or(0);
         self.opened_ranges
             .entry(reg)
-            .or_insert_with(|| MemoryRange::new(batch_index, reg))
+            .or_insert_with(|| MemoryRange::new(std::cmp::min(batch_index, valid_start), reg))
     }
 
-    fn seal(&mut self, reg: usize) {
+    fn seal(&mut self, batch_index: usize, reg: usize) {
         if let Some(range) = self.opened_ranges.remove(&reg) {
             self.sealed_ranges.push(range);
         }
+        self.valid_batch_start.insert(reg, batch_index + 1);
     }
 
     fn seal_remaining(mut self) -> Vec<MemoryRange> {
@@ -766,8 +769,8 @@ fn build_memory_hints(basic_block: &mut BasicBlock) {
         // Since each write batch is considered to be atomic, we will
         // only seal ranges after all register reads are performed.
         for reg in extract_register_writes(batch) {
-            read_merger.seal(reg);
-            write_merger.seal(reg);
+            read_merger.seal(i, reg);
+            write_merger.seal(i, reg);
         }
     }
 
