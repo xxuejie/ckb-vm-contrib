@@ -634,8 +634,7 @@ impl MemoryRange {
         }
     }
 
-    fn insert(&mut self, offset: u64, offset2: u64, size: u64) {
-        let offset: u128 = offset as u128 + offset2 as u128;
+    fn insert(&mut self, offset: u128, size: u64) {
         self.lapper.insert(Interval {
             start: offset,
             stop: offset + size as u128,
@@ -678,11 +677,12 @@ struct MemoryMerger {
     // particular real register value.
     //
     // virtual_reg -> (real_reg, batch_start, additional_offset)
-    virtual_regs: HashMap<usize, (usize, usize, u64)>,
+    virtual_regs: HashMap<usize, (usize, usize, u128)>,
 }
 
 impl MemoryMerger {
     fn insert(&mut self, batch_index: usize, reg: usize, offset: u64, size: u64) {
+        let offset = offset as u128;
         let (real_reg, real_batch_start, additional_offset) = match self.virtual_regs.get(&reg) {
             Some((reg, batch_start, offset)) => (*reg, *batch_start, *offset),
             None => (
@@ -696,12 +696,13 @@ impl MemoryMerger {
             .or_insert_with(|| {
                 MemoryRange::new(std::cmp::min(batch_index, real_batch_start), real_reg)
             })
-            .insert(offset, additional_offset, size);
+            .insert(offset + additional_offset, size);
     }
 
     fn seal(&mut self, batch_index: usize, writes: &HashMap<usize, Value>) {
         for (reg, value) in writes {
             if let Some((real_reg, offset)) = extract_register_n_offset(&simplify(value)) {
+                let offset = offset as u128;
                 // Nested simplifying, since writes are iteratively processed,
                 // loops are not needed here.
                 let (real_reg, real_batch_start, offset) = if let Some((
@@ -710,8 +711,7 @@ impl MemoryMerger {
                     a_offset,
                 )) = self.virtual_regs.get(&real_reg)
                 {
-                    // TODO: is wrapping_add correct here?
-                    (*a_reg, *a_batch_start, a_offset.wrapping_add(offset))
+                    (*a_reg, *a_batch_start, a_offset + offset)
                 } else {
                     let real_batch_start =
                         self.valid_batch_start.get(&real_reg).cloned().unwrap_or(0);
