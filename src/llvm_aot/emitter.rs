@@ -2165,6 +2165,7 @@ fn emit_writes<'a>(
                 address,
                 size,
                 value,
+                hinted: _hinted,
             } => {
                 let address = emit_value(
                     context,

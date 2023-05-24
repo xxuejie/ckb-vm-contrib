@@ -815,13 +815,22 @@ fn extract_memory_loads(writes: &mut [Write]) -> Vec<(usize, u64, u64)> {
     result
 }
 
-fn extract_memory_writes(writes: &[Write]) -> Vec<(usize, u64, u64)> {
+fn extract_memory_writes(writes: &mut [Write]) -> Vec<(usize, u64, u64)> {
     let mut result = Vec::new();
     for write in writes {
         match write {
-            Write::Memory { address, size, .. } => {
+            Write::Memory {
+                address,
+                size,
+                hinted,
+                ..
+            } => {
                 if let Some((reg, offset)) = extract_register_n_offset(address) {
                     result.push((reg, offset, *size as u64));
+                    *hinted = true;
+                } else if let Value::Imm(imm) = address {
+                    result.push((0, *imm, *size as u64));
+                    *hinted = true;
                 }
             }
             _ => (),

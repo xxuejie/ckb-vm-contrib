@@ -25,6 +25,7 @@ pub enum Write {
         address: Value,
         size: u8,
         value: Value,
+        hinted: bool,
     },
     Register {
         index: usize,
@@ -68,12 +69,14 @@ impl fmt::Display for Write {
                 address,
                 size,
                 value,
+                hinted,
             } => write!(
                 f,
-                "Memory[ {} ]@{} = {}",
+                "Memory[ {} ]@{} = {}{}",
                 PrettyValue::new(address),
                 size,
                 PrettyValue::new(value),
+                if *hinted { "" } else { "  [Unhinted]" },
             ),
             Write::Register { index, value } => write!(
                 f,
@@ -357,6 +360,7 @@ impl Memory for AstMachine {
             address: addr.clone(),
             size: 1,
             value: value.clone(),
+            hinted: false,
         });
         Ok(())
     }
@@ -366,6 +370,7 @@ impl Memory for AstMachine {
             address: addr.clone(),
             size: 2,
             value: value.clone(),
+            hinted: false,
         });
         Ok(())
     }
@@ -375,6 +380,7 @@ impl Memory for AstMachine {
             address: addr.clone(),
             size: 4,
             value: value.clone(),
+            hinted: false,
         });
         Ok(())
     }
@@ -384,6 +390,7 @@ impl Memory for AstMachine {
             address: addr.clone(),
             size: 8,
             value: value.clone(),
+            hinted: false,
         });
         Ok(())
     }
