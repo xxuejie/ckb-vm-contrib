@@ -950,6 +950,30 @@ fn emit_store_with_value_offset_to_machine<'a>(
     Ok(())
 }
 
+// Emit code to fetch load reservation address from machine
+fn emit_fetch_load_reservation_address<'a>(
+    context: &'a Context,
+    emit_data: &EmitData<'a>,
+    machine: IntValue<'a>,
+) -> Result<PointerValue<'a>, Error> {
+    let i64t = context.i64_type();
+    let i64pt = i64t.ptr_type(AddressSpace::default());
+
+    let address_value = emit_load_from_machine(
+        context,
+        emit_data,
+        machine,
+        offset_of!(LlvmAotCoreMachineData, load_reservation_ptr),
+        i64t,
+        Some("load_reservation_address_value"),
+    )?;
+    let address =
+        emit_data
+            .builder
+            .build_int_to_ptr(address_value, i64pt, "load_reservation_pointer");
+    Ok(address)
+}
+
 // Emit load from LlvmAotCoreMachineData operation
 fn emit_load_from_machine<'a>(
     context: &'a Context,
@@ -1337,14 +1361,14 @@ fn emit_value<'a>(
             // TODO: handle unhinted load here
             emit_value(context, emit_data, emitting_func, &*val, Some("external"))
         }
-        Value::Lr => emit_load_from_machine(
-            context,
-            emit_data,
-            machine,
-            offset_of!(LlvmAotCoreMachineData, load_reservation_address),
-            i64t,
-            Some("lr"),
-        ),
+        Value::Lr => Ok(emit_data
+            .builder
+            .build_load(
+                i64t,
+                emit_fetch_load_reservation_address(context, emit_data, machine)?,
+                "lr",
+            )
+            .into_int_value()),
         Value::Imm(i) => Ok(i64t.const_int(*i, false)),
         Value::Register(r) => emit_load_reg(context, emit_data, machine, allocas, *r, name),
         Value::Op1(op, val) => {
@@ -2218,15 +2242,10 @@ fn emit_writes<'a>(
         emit_data.builder.build_store(real_address, value);
     }
     if let Some(value) = lr_op {
-        emit_store_to_machine(
-            context,
-            emit_data,
-            emitting_func.machine,
+        emit_data.builder.build_store(
+            emit_fetch_load_reservation_address(context, emit_data, emitting_func.machine)?,
             value,
-            offset_of!(LlvmAotCoreMachineData, load_reservation_address),
-            context.i64_type(),
-            Some("lr"),
-        )?;
+        );
     }
     for (index, value) in register_ops {
         emit_store_reg(

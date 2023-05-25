@@ -4,7 +4,7 @@ use ckb_vm::{
 use ckb_vm_contrib::{
     llvm_aot::{
         ast::Control, preprocess, DlSymbols, Func, LlvmAotCoreMachine, LlvmAotMachine,
-        LlvmCompilingMachine,
+        LlvmCompilingMachine, MmapMemory,
     },
     syscalls::{DebugSyscall, TimeSyscall},
 };
@@ -147,12 +147,12 @@ fn main() -> Result<(), Error> {
 
             let dl_symbols = DlSymbols::new(library_path, &args.symbol_prefix)?;
             let aot_symbols = &dl_symbols.aot_symbols;
-            let core_machine =
-                DefaultMachineBuilder::new(LlvmAotCoreMachine::new(args.memory_size)?)
-                    .instruction_cycle_func(Box::new(estimate_cycles))
-                    .syscall(Box::new(DebugSyscall {}))
-                    .syscall(Box::new(TimeSyscall::new()))
-                    .build();
+            let memory = Box::new(MmapMemory::create(args.memory_size)?);
+            let core_machine = DefaultMachineBuilder::new(LlvmAotCoreMachine::new(memory)?)
+                .instruction_cycle_func(Box::new(estimate_cycles))
+                .syscall(Box::new(DebugSyscall {}))
+                .syscall(Box::new(TimeSyscall::new()))
+                .build();
             let mut machine = LlvmAotMachine::new_with_machine(core_machine, &aot_symbols)?;
             machine.set_max_cycles(args.max_cycles);
             let run_args: Vec<Bytes> = args

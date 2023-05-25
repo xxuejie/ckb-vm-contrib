@@ -1,12 +1,14 @@
 pub mod ast;
 mod compiler;
 mod emitter;
+mod memory;
 mod preprocessor;
 mod runner;
 mod symbols;
 mod utils;
 
 pub use compiler::LlvmCompilingMachine;
+pub use memory::{mmap::MmapMemory, AotMemory, Hint};
 pub use preprocessor::{preprocess, BasicBlock, Func};
 pub use runner::{LlvmAotCoreMachine, LlvmAotCoreMachineData, LlvmAotMachine};
 pub use symbols::{
