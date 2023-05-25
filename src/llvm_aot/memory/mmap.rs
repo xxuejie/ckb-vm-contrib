@@ -74,7 +74,7 @@ impl AotMemory for MmapMemory {
         // For mmap memory load / store check is a no-op since OS will help
         // us check memory permissions
         for hint in hints {
-            if hint.is_executable() {
+            if hint.is_execute() {
                 self.inner_execute_check(hint.offset, hint.size)?;
             }
         }

@@ -1,4 +1,5 @@
 pub mod mmap;
+pub mod plain;
 
 use ckb_vm::{memory::memset, Bytes, Error};
 use std::cmp::min;
@@ -20,7 +21,7 @@ impl Hint {
         (self.flags & HINT_FLAG_WRITE) != 0
     }
 
-    pub fn is_executable(&self) -> bool {
+    pub fn is_execute(&self) -> bool {
         (self.flags & HINT_FLAG_EXECUTABLE) != 0
     }
 }
