@@ -1,10 +1,13 @@
 use super::{AotMemory, Hint};
 use ckb_vm::{
     ckb_vm_definitions::{MEMORY_FRAMESIZE, RISCV_PAGESIZE},
-    memory::{round_page_down, round_page_up, FLAG_EXECUTABLE, FLAG_FREEZED, FLAG_WXORX_BIT},
+    memory::{
+        memset, round_page_down, round_page_up, FLAG_EXECUTABLE, FLAG_FREEZED, FLAG_WXORX_BIT,
+    },
     Bytes, Error,
 };
 use std::alloc::{alloc, dealloc, Layout};
+use std::slice::from_raw_parts_mut;
 
 // Plain memory that does manual bound checking, suitable for library usage.
 pub struct PlainMemory {
@@ -101,7 +104,11 @@ impl AotMemory for PlainMemory {
             let mut frame = addr / frame_size;
             while frame * frame_size < addr + size {
                 if self.frames[frame as usize] == 0 {
-                    self.store_byte(addr, size, 0)?;
+                    let host_addr = self
+                        .memory_ptr()
+                        .wrapping_offset((frame * frame_size) as isize);
+                    let mut dst = unsafe { from_raw_parts_mut(host_addr, frame_size as usize) };
+                    memset(&mut dst, 0);
                     self.frames[frame as usize] = 1;
                 }
                 frame += 1;

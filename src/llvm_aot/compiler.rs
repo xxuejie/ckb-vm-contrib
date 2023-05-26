@@ -17,6 +17,7 @@ impl LlvmCompilingMachine {
         symbol_prefix: &str,
         instruction_cycle_func: &InstructionCycleFunc,
         generate_debug_info: bool,
+        check_memory_bounds: bool,
     ) -> Result<Self, Error> {
         let code = emitter::load(
             output_path,
@@ -24,6 +25,7 @@ impl LlvmCompilingMachine {
             symbol_prefix,
             instruction_cycle_func,
             generate_debug_info,
+            check_memory_bounds,
         )?;
 
         Ok(Self { code })

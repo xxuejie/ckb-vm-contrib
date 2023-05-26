@@ -898,8 +898,11 @@ fn build_memory_hints(basic_block: &mut BasicBlock) {
             basic_block.write_batches[range.batch_index].insert(
                 0,
                 Write::Hint {
-                    reg: range.register,
-                    offset,
+                    address: Value::Op2(
+                        ActionOp2::Add,
+                        Value::Register(range.register).into(),
+                        Value::Imm(offset).into(),
+                    ),
                     size,
                     write: false,
                 },
@@ -911,8 +914,11 @@ fn build_memory_hints(basic_block: &mut BasicBlock) {
             basic_block.write_batches[range.batch_index].insert(
                 0,
                 Write::Hint {
-                    reg: range.register,
-                    offset,
+                    address: Value::Op2(
+                        ActionOp2::Add,
+                        Value::Register(range.register).into(),
+                        Value::Imm(offset).into(),
+                    ),
                     size,
                     write: true,
                 },

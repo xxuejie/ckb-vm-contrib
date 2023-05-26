@@ -13,8 +13,7 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub enum Write {
     Hint {
-        reg: usize,
-        offset: u64,
+        address: Value,
         size: u64,
         write: bool,
     },
@@ -49,18 +48,16 @@ impl fmt::Display for Write {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Write::Hint {
-                reg,
-                offset,
+                address,
                 size,
                 write,
             } => {
                 let prefix = if *write { "Write" } else { "Read" };
                 write!(
                     f,
-                    "{}Hint: Reg({}) + 0x{:x}, size: 0x{:x}",
+                    "{}Hint: {}, size: 0x{:x}",
                     prefix,
-                    register_names(*reg),
-                    offset,
+                    PrettyValue::new(address),
                     size
                 )
             }

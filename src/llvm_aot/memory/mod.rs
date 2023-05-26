@@ -5,8 +5,8 @@ use ckb_vm::{memory::memset, Bytes, Error};
 use std::cmp::min;
 use std::slice::from_raw_parts_mut;
 
-const HINT_FLAG_WRITE: u64 = 0x1;
-const HINT_FLAG_EXECUTABLE: u64 = 0x2;
+pub const HINT_FLAG_WRITE: u64 = 0x1;
+pub const HINT_FLAG_EXECUTABLE: u64 = 0x2;
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -52,6 +52,11 @@ pub trait AotMemory {
     ) -> Result<(), Error>;
 
     fn store_byte(&mut self, addr: u64, size: u64, value: u8) -> Result<(), Error> {
+        self.check_permissions(&[Hint {
+            offset: addr,
+            size,
+            flags: HINT_FLAG_WRITE,
+        }])?;
         let host_addr = self.memory_ptr().wrapping_offset(addr as isize);
         let mut dst = unsafe { from_raw_parts_mut(host_addr, size as usize) };
         memset(&mut dst, value);
@@ -59,6 +64,11 @@ pub trait AotMemory {
     }
 
     fn store_bytes(&mut self, addr: u64, value: &[u8]) -> Result<(), Error> {
+        self.check_permissions(&[Hint {
+            offset: addr,
+            size: value.len() as u64,
+            flags: HINT_FLAG_WRITE,
+        }])?;
         let host_addr = self.memory_ptr().wrapping_offset(addr as isize);
         let dst = unsafe { from_raw_parts_mut(host_addr, value.len()) };
         dst.copy_from_slice(value);
