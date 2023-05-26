@@ -1,22 +1,22 @@
 use super::{
+    memory::{AotMemory, Hint, HINT_FLAG_WRITE},
     symbols::{AotSymbols, EntryFunctionType},
     AOT_ISA, AOT_VERSION,
 };
 use ckb_vm::{
-    ckb_vm_definitions::{RISCV_GENERAL_REGISTER_NUMBER, RISCV_PAGESIZE},
+    ckb_vm_definitions::RISCV_GENERAL_REGISTER_NUMBER,
     decoder::{build_decoder, Decoder},
     instructions::{
         execute, extract_opcode, insts, is_basic_block_end_instruction, Instruction, Itype,
     },
     machine::{DefaultMachine, DefaultMachineBuilder},
-    memory::{fill_page_data, memset, round_page_down, round_page_up, FLAG_EXECUTABLE},
+    memory::memset,
     registers::{RA, ZERO},
-    Bytes, CoreMachine, Error, Machine, Memory, SupportMachine,
+    Bytes, CoreMachine, Error, Machine, Memory, Register, SupportMachine,
 };
-use region::{self, alloc, query_range, Allocation, Protection, Region};
 use std::collections::HashMap;
 use std::ptr;
-use std::slice::from_raw_parts_mut;
+use std::slice::{from_raw_parts, from_raw_parts_mut};
 
 const RUNTIME_FLAG_RUNNING: u8 = 1;
 
@@ -50,6 +50,8 @@ pub struct LlvmAotMachineEnv {
     pub indirect_call: unsafe extern "C" fn(m: *mut LlvmAotMachine, riscv_addr: u64) -> u64,
     pub arbitrary_jump:
         unsafe extern "C" fn(m: *mut LlvmAotMachine, current_func_start: u64) -> u64,
+    pub check_memory_permissions:
+        unsafe extern "C" fn(m: *mut LlvmAotMachine, permissions: *const u64) -> u64,
 }
 
 unsafe extern "C" fn bare_ecall(m: *mut LlvmAotMachine) -> u64 {
@@ -152,9 +154,25 @@ fn is_ret_instruction(i: Instruction) -> bool {
     i.rd() == ZERO && i.rs1() == RA && i.immediate_u() == 0
 }
 
+unsafe extern "C" fn bare_check_permissions(
+    m: *mut LlvmAotMachine,
+    permissions: *const u64,
+) -> u64 {
+    let size = ptr::read(permissions);
+    let hints = from_raw_parts(permissions.offset(1) as *const Hint, size as usize);
+    let mut m = &mut *m;
+    match m.machine.inner_mut().memory.check_permissions(hints) {
+        Ok(()) => 0,
+        Err(e) => {
+            m.bare_call_error = Some(e);
+            BARE_FUNC_ERROR_OR_TERMINATED
+        }
+    }
+}
+
 impl LlvmAotMachine {
-    pub fn new(memory_size: usize, aot_symbols: &AotSymbols) -> Result<Self, Error> {
-        let core_machine = LlvmAotCoreMachine::new(memory_size)?;
+    pub fn new(memory: Box<dyn AotMemory>, aot_symbols: &AotSymbols) -> Result<Self, Error> {
+        let core_machine = LlvmAotCoreMachine::new(memory)?;
         let machine = DefaultMachineBuilder::new(core_machine).build();
         Self::new_with_machine(machine, aot_symbols)
     }
@@ -283,6 +301,7 @@ impl LlvmAotMachine {
             ebreak: bare_ebreak,
             indirect_call: bare_indirect_call,
             arbitrary_jump: bare_arbitrary_jump,
+            check_memory_permissions: bare_check_permissions,
         }
     }
 }
@@ -290,8 +309,6 @@ impl LlvmAotMachine {
 #[repr(C)]
 pub struct LlvmAotCoreMachineData {
     pub pc: u64,
-    pub memory: *mut u8,
-    pub load_reservation_address: u64,
     pub cycles: u64,
     pub max_cycles: u64,
     pub registers: [u64; RISCV_GENERAL_REGISTER_NUMBER],
@@ -301,32 +318,22 @@ pub struct LlvmAotCoreMachineData {
     pub exit_aot_reason: u8,
     pub jmpbuf: [u64; 5],
 
+    pub memory: *mut u8,
+    pub load_reservation_ptr: *mut u64,
     pub env: *const LlvmAotMachineEnv,
 }
 
 pub struct LlvmAotCoreMachine {
     pub data: LlvmAotCoreMachineData,
-
-    pub memory_size: usize,
-    pub allocation: Allocation,
-    pub cached_region: Option<Region>,
+    pub memory: LlvmAotMemory,
 }
 
 impl LlvmAotCoreMachine {
-    pub fn new(memory_size: usize) -> Result<Self, Error> {
-        if memory_size % RISCV_PAGESIZE != 0 {
-            return Err(Error::External(
-                "Memory size must be a multiple of 4KB!".to_string(),
-            ));
-        }
-
-        let mut memory = alloc(memory_size, Protection::READ_WRITE)
-            .map_err(|e| Error::External(format!("region alloc error: {}", e)))?;
+    pub fn new(memory: Box<dyn AotMemory>) -> Result<Self, Error> {
+        let mut memory = LlvmAotMemory::new(memory)?;
 
         let data = LlvmAotCoreMachineData {
             pc: 0,
-            memory: memory.as_mut_ptr(),
-            load_reservation_address: 0,
             cycles: 0,
             max_cycles: 0,
             registers: [0u64; RISCV_GENERAL_REGISTER_NUMBER],
@@ -335,51 +342,18 @@ impl LlvmAotCoreMachine {
             runtime_flags: 0,
             exit_aot_reason: 0,
             jmpbuf: [0u64; 5],
+            memory: memory.memory_ptr(),
+            load_reservation_ptr: (&mut memory.load_reservation_address) as *mut u64,
             env: ptr::null(),
         };
 
-        Ok(Self {
-            data,
-            memory_size,
-            allocation: memory,
-            cached_region: None,
-        })
-    }
-
-    fn execute_check(&mut self, addr: u64, len: usize) -> Result<*const u8, Error> {
-        let host_addr = self.data.memory.wrapping_offset(addr as isize);
-        if let Some(region) = self.cached_region {
-            let r = region.as_range();
-            if host_addr as usize >= r.start && host_addr as usize + len <= r.end {
-                return Ok(host_addr);
-            }
-        }
-        let ranges: Vec<Region> = query_range(host_addr, len)
-            .map_err(e)?
-            .try_fold(vec![], |mut acc, r| match r {
-                Ok(r) => {
-                    acc.push(r);
-                    Ok(acc)
-                }
-                Err(e) => Err(e),
-            })
-            .map_err(e)?;
-        if ranges.iter().any(|r| !r.is_executable()) {
-            return Err(Error::External(format!(
-                "addr: {:x} executing on non executable pages!",
-                addr
-            )));
-        }
-        if ranges.len() == 1 {
-            self.cached_region = Some(ranges[0]);
-        }
-        Ok(host_addr)
+        Ok(Self { data, memory })
     }
 }
 
 impl CoreMachine for LlvmAotCoreMachine {
     type REG = u64;
-    type MEM = Self;
+    type MEM = LlvmAotMemory;
 
     fn pc(&self) -> &Self::REG {
         &self.data.pc
@@ -394,11 +368,11 @@ impl CoreMachine for LlvmAotCoreMachine {
     }
 
     fn memory(&self) -> &Self::MEM {
-        self
+        &self.memory
     }
 
     fn memory_mut(&mut self) -> &mut Self::MEM {
-        self
+        &mut self.memory
     }
 
     fn registers(&self) -> &[Self::REG] {
@@ -450,7 +424,47 @@ impl SupportMachine for LlvmAotCoreMachine {
     }
 }
 
-impl Memory for LlvmAotCoreMachine {
+pub struct LlvmAotMemory {
+    pub memory: Box<dyn AotMemory>,
+    pub load_reservation_address: u64,
+}
+
+impl LlvmAotMemory {
+    pub fn new(memory: Box<dyn AotMemory>) -> Result<Self, Error> {
+        Ok(Self {
+            memory,
+            load_reservation_address: 0,
+        })
+    }
+}
+
+impl AotMemory for LlvmAotMemory {
+    fn memory_size(&self) -> usize {
+        self.memory.memory_size()
+    }
+
+    fn memory_ptr(&mut self) -> *mut u8 {
+        self.memory.memory_ptr()
+    }
+
+    fn check_permissions(&mut self, hints: &[Hint]) -> Result<(), Error> {
+        self.memory.check_permissions(hints)
+    }
+
+    fn init_pages(
+        &mut self,
+        addr: u64,
+        size: u64,
+        flags: u8,
+        source: Option<Bytes>,
+        offset_from_addr: u64,
+    ) -> Result<(), Error> {
+        self.memory
+            .init_pages(addr, size, flags, source, offset_from_addr)
+    }
+}
+
+impl Memory for LlvmAotMemory {
     type REG = u64;
 
     fn new() -> Self {
@@ -462,7 +476,7 @@ impl Memory for LlvmAotCoreMachine {
     }
 
     fn memory_size(&self) -> usize {
-        self.memory_size
+        self.memory.memory_size()
     }
 
     fn init_pages(
@@ -473,35 +487,10 @@ impl Memory for LlvmAotCoreMachine {
         source: Option<Bytes>,
         offset_from_addr: u64,
     ) -> Result<(), Error> {
-        if round_page_down(addr) != addr || round_page_up(size) != size {
-            return Err(Error::MemPageUnalignedAccess);
-        }
-        let memory_size = self.allocation.len();
-        if addr > memory_size as u64
-            || size > memory_size as u64
-            || addr + size > memory_size as u64
-            || offset_from_addr > size
-        {
-            return Err(Error::MemOutOfBound);
-        }
-        let host_addr = self.data.memory.wrapping_offset(addr as isize);
-        let mut ranges = query_range(host_addr, size as usize).map_err(e)?;
-        if ranges.any(|r| r.is_ok() && r.unwrap().is_executable()) {
-            return Err(Error::MemWriteOnFreezedPage);
-        }
-        fill_page_data(self, addr, size, source, offset_from_addr)?;
-        let protection = if flags & FLAG_EXECUTABLE != 0 {
-            Protection::READ_EXECUTE
-        } else {
-            Protection::READ_WRITE
-        };
-        unsafe { region::protect(host_addr, size as usize, protection) }.map_err(e)?;
-        self.cached_region = None;
-        Ok(())
+        self.memory
+            .init_pages(addr, size, flags, source, offset_from_addr)
     }
 
-    // TODO: right now we leverage host OS to mark the pages as executable,
-    // is it secure to mark RISC-V code executable on a x86/arm CPU?
     fn execute_load16(&mut self, addr: u64) -> Result<u16, Error> {
         let host_addr = self.execute_check(addr, 2)?;
         Ok(unsafe { ptr::read(host_addr as *const u16) })
@@ -513,25 +502,45 @@ impl Memory for LlvmAotCoreMachine {
     }
 
     fn load8(&mut self, addr: &Self::REG) -> Result<Self::REG, Error> {
-        let host_addr = self.data.memory.wrapping_offset(*addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr.to_u64(),
+            size: 1,
+            flags: 0,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(*addr as isize);
         let value: u8 = unsafe { ptr::read(host_addr) };
         Ok(u64::from(value))
     }
 
     fn load16(&mut self, addr: &Self::REG) -> Result<Self::REG, Error> {
-        let host_addr = self.data.memory.wrapping_offset(*addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr.to_u64(),
+            size: 2,
+            flags: 0,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(*addr as isize);
         let value: u16 = unsafe { ptr::read(host_addr as *const u16) };
         Ok(u64::from(value))
     }
 
     fn load32(&mut self, addr: &Self::REG) -> Result<Self::REG, Error> {
-        let host_addr = self.data.memory.wrapping_offset(*addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr.to_u64(),
+            size: 4,
+            flags: 0,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(*addr as isize);
         let value: u32 = unsafe { ptr::read(host_addr as *const u32) };
         Ok(u64::from(value))
     }
 
     fn load64(&mut self, addr: &Self::REG) -> Result<Self::REG, Error> {
-        let host_addr = self.data.memory.wrapping_offset(*addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr.to_u64(),
+            size: 8,
+            flags: 0,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(*addr as isize);
         let value: u64 = unsafe { ptr::read(host_addr as *const u64) };
         Ok(value)
     }
@@ -539,27 +548,47 @@ impl Memory for LlvmAotCoreMachine {
     // TODO: dirty tracking, or maybe we should rethink on how to implement
     // suspend/resume in such a design?
     fn store_byte(&mut self, addr: u64, size: u64, value: u8) -> Result<(), Error> {
-        let host_addr = self.data.memory.wrapping_offset(addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr,
+            size,
+            flags: HINT_FLAG_WRITE,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(addr as isize);
         let mut dst = unsafe { from_raw_parts_mut(host_addr, size as usize) };
         memset(&mut dst, value);
         Ok(())
     }
 
     fn store_bytes(&mut self, addr: u64, value: &[u8]) -> Result<(), Error> {
-        let host_addr = self.data.memory.wrapping_offset(addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr,
+            size: value.len() as u64,
+            flags: HINT_FLAG_WRITE,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(addr as isize);
         let dst = unsafe { from_raw_parts_mut(host_addr, value.len()) };
         dst.copy_from_slice(value);
         Ok(())
     }
 
     fn load_bytes(&mut self, addr: u64, size: u64) -> Result<Bytes, Error> {
-        let host_addr = self.data.memory.wrapping_offset(addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr,
+            size,
+            flags: 0,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(addr as isize);
         let src = unsafe { from_raw_parts_mut(host_addr, size as usize) };
         Ok(src.to_vec().into())
     }
 
     fn store8(&mut self, addr: &Self::REG, value: &Self::REG) -> Result<(), Error> {
-        let host_addr = self.data.memory.wrapping_offset(*addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr.to_u64(),
+            size: 1,
+            flags: HINT_FLAG_WRITE,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(*addr as isize);
         unsafe {
             ptr::write(host_addr, *value as u8);
         }
@@ -567,7 +596,12 @@ impl Memory for LlvmAotCoreMachine {
     }
 
     fn store16(&mut self, addr: &Self::REG, value: &Self::REG) -> Result<(), Error> {
-        let host_addr = self.data.memory.wrapping_offset(*addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr.to_u64(),
+            size: 2,
+            flags: HINT_FLAG_WRITE,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(*addr as isize);
         unsafe {
             ptr::write(host_addr as *mut u16, *value as u16);
         }
@@ -575,7 +609,12 @@ impl Memory for LlvmAotCoreMachine {
     }
 
     fn store32(&mut self, addr: &Self::REG, value: &Self::REG) -> Result<(), Error> {
-        let host_addr = self.data.memory.wrapping_offset(*addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr.to_u64(),
+            size: 4,
+            flags: HINT_FLAG_WRITE,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(*addr as isize);
         unsafe {
             ptr::write(host_addr as *mut u32, *value as u32);
         }
@@ -583,7 +622,12 @@ impl Memory for LlvmAotCoreMachine {
     }
 
     fn store64(&mut self, addr: &Self::REG, value: &Self::REG) -> Result<(), Error> {
-        let host_addr = self.data.memory.wrapping_offset(*addr as isize);
+        self.check_permissions(&[Hint {
+            offset: addr.to_u64(),
+            size: 8,
+            flags: HINT_FLAG_WRITE,
+        }])?;
+        let host_addr = self.memory_ptr().wrapping_offset(*addr as isize);
         unsafe {
             ptr::write(host_addr as *mut u64, *value as u64);
         }
@@ -603,14 +647,10 @@ impl Memory for LlvmAotCoreMachine {
     }
 
     fn lr(&self) -> &Self::REG {
-        &self.data.load_reservation_address
+        &self.load_reservation_address
     }
 
     fn set_lr(&mut self, value: &Self::REG) {
-        self.data.load_reservation_address = *value;
+        self.load_reservation_address = *value;
     }
-}
-
-fn e(error: region::Error) -> Error {
-    Error::External(format!("region error: {}", error))
 }

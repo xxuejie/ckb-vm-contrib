@@ -3,8 +3,8 @@ use ckb_vm::{
 };
 use ckb_vm_contrib::{
     llvm_aot::{
-        ast::Control, preprocess, DlSymbols, Func, LlvmAotCoreMachine, LlvmAotMachine,
-        LlvmCompilingMachine,
+        ast::Control, preprocess, AotMemory, DlSymbols, Func, LlvmAotCoreMachine, LlvmAotMachine,
+        LlvmCompilingMachine, MmapMemory, PlainMemory,
     },
     syscalls::{DebugSyscall, TimeSyscall},
 };
@@ -29,6 +29,12 @@ enum Generate {
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
+enum MemoryMode {
+    Mmap,
+    Plain,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum OptimizeLevel {
     Default,
     None,
@@ -45,9 +51,17 @@ struct Args {
     #[clap(long, default_value = "default")]
     optimize_level: OptimizeLevel,
 
+    /// Memory mode to use
+    #[clap(long, default_value = "mmap")]
+    memory_mode: MemoryMode,
+
     /// Generate debug information
     #[clap(short, long)]
     debug_info: bool,
+
+    /// Check memory bounds
+    #[clap(short, long)]
+    check_bounds: bool,
 
     /// Max cycles when running the program
     #[clap(short, long, default_value = "18446744073709551615")]
@@ -117,6 +131,7 @@ fn main() -> Result<(), Error> {
                 &args.symbol_prefix,
                 &estimate_cycles,
                 args.debug_info,
+                args.check_bounds,
             )?;
             let bitcode = machine.bitcode(args.optimized())?;
             if args.time {
@@ -128,31 +143,39 @@ fn main() -> Result<(), Error> {
         }
         Generate::Object => {
             let output = args.output.clone().unwrap_or("a.o".to_string());
-            build_object(&code, &args, &output)?;
+            build_object(&code, &args, &output, args.check_bounds)?;
         }
         Generate::SharedLibrary => {
             let object_file = Builder::new().suffix(".o").tempfile()?;
             let object_path = object_file.path().to_str().expect("tempfile");
-            build_object(&code, &args, object_path)?;
+            build_object(&code, &args, object_path, args.check_bounds)?;
             let output = args.output.unwrap_or("a.so".to_string());
             build_shared_library(object_path, &output)?;
         }
         Generate::RunResult => {
             let object_file = Builder::new().suffix(".o").tempfile()?;
             let object_path = object_file.path().to_str().expect("tempfile");
-            build_object(&code, &args, object_path)?;
+            if !args.check_bounds {
+                if let MemoryMode::Plain = args.memory_mode {
+                    println!("WARNING: you are skipping memory bound checking in plain memory mode, this shall only be used for experiment purposes, never use this combination for production!");
+                }
+            }
+            build_object(&code, &args, object_path, args.check_bounds)?;
             let library_file = Builder::new().suffix(".so").tempfile()?;
             let library_path = library_file.path().to_str().expect("tempfile");
             build_shared_library(object_path, library_path)?;
 
             let dl_symbols = DlSymbols::new(library_path, &args.symbol_prefix)?;
             let aot_symbols = &dl_symbols.aot_symbols;
-            let core_machine =
-                DefaultMachineBuilder::new(LlvmAotCoreMachine::new(args.memory_size)?)
-                    .instruction_cycle_func(Box::new(estimate_cycles))
-                    .syscall(Box::new(DebugSyscall {}))
-                    .syscall(Box::new(TimeSyscall::new()))
-                    .build();
+            let memory: Box<dyn AotMemory> = match args.memory_mode {
+                MemoryMode::Mmap => Box::new(MmapMemory::create(args.memory_size)?),
+                MemoryMode::Plain => Box::new(PlainMemory::create(args.memory_size)?),
+            };
+            let core_machine = DefaultMachineBuilder::new(LlvmAotCoreMachine::new(memory)?)
+                .instruction_cycle_func(Box::new(estimate_cycles))
+                .syscall(Box::new(DebugSyscall {}))
+                .syscall(Box::new(TimeSyscall::new()))
+                .build();
             let mut machine = LlvmAotMachine::new_with_machine(core_machine, &aot_symbols)?;
             machine.set_max_cycles(args.max_cycles);
             let run_args: Vec<Bytes> = args
@@ -186,7 +209,7 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn build_object(code: &Bytes, args: &Args, output: &str) -> Result<(), Error> {
+fn build_object(code: &Bytes, args: &Args, output: &str, check_bounds: bool) -> Result<(), Error> {
     let t0 = SystemTime::now();
     let machine = LlvmCompilingMachine::load(
         output,
@@ -194,6 +217,7 @@ fn build_object(code: &Bytes, args: &Args, output: &str) -> Result<(), Error> {
         &args.symbol_prefix,
         &estimate_cycles,
         args.debug_info,
+        check_bounds,
     )?;
     let object = machine.aot(args.optimized())?;
     if args.time {

@@ -1,5 +1,6 @@
 use super::{
-    ast::{register_names, Control, Write},
+    ast::{register_names, Control, ExternalType, Write},
+    memory::HINT_FLAG_WRITE,
     preprocessor::{preprocess, Func},
     runner::{
         LlvmAotCoreMachineData, LlvmAotMachineEnv, BARE_FUNC_ERROR_OR_TERMINATED, BARE_FUNC_RETURN,
@@ -71,6 +72,7 @@ pub struct Code {
     name: String,
     directory: String,
     generate_debug_info: bool,
+    check_memory_bounds: bool,
 }
 
 pub struct EmitData<'a> {
@@ -354,6 +356,7 @@ pub fn load<'a>(
     symbol_prefix: &str,
     instruction_cycle_func: &InstructionCycleFunc,
     generate_debug_info: bool,
+    check_memory_bounds: bool,
 ) -> Result<Code, Error> {
     let name = Path::new(output_path)
         .file_name()
@@ -374,6 +377,7 @@ pub fn load<'a>(
         name: name.to_string(),
         directory: directory.to_string(),
         generate_debug_info,
+        check_memory_bounds,
     })
 }
 
@@ -950,6 +954,30 @@ fn emit_store_with_value_offset_to_machine<'a>(
     Ok(())
 }
 
+// Emit code to fetch load reservation address from machine
+fn emit_fetch_load_reservation_address<'a>(
+    context: &'a Context,
+    emit_data: &EmitData<'a>,
+    machine: IntValue<'a>,
+) -> Result<PointerValue<'a>, Error> {
+    let i64t = context.i64_type();
+    let i64pt = i64t.ptr_type(AddressSpace::default());
+
+    let address_value = emit_load_from_machine(
+        context,
+        emit_data,
+        machine,
+        offset_of!(LlvmAotCoreMachineData, load_reservation_ptr),
+        i64t,
+        Some("load_reservation_address_value"),
+    )?;
+    let address =
+        emit_data
+            .builder
+            .build_int_to_ptr(address_value, i64pt, "load_reservation_pointer");
+    Ok(address)
+}
+
 // Emit load from LlvmAotCoreMachineData operation
 fn emit_load_from_machine<'a>(
     context: &'a Context,
@@ -1315,6 +1343,136 @@ fn emit_ffi_call<'a>(
     Ok(result)
 }
 
+// Emit memory hints
+fn emit_hints<'a>(
+    context: &'a Context,
+    emit_data: &EmitData<'a>,
+    emitting_func: &EmittingFunc<'a>,
+    hints: &[&Write],
+) -> Result<(), Error> {
+    if !emit_data.code.check_memory_bounds {
+        return Ok(());
+    }
+    if hints.len() == 0 {
+        return Ok(());
+    }
+
+    let i64t = context.i64_type();
+    let len: u32 = (1 + 3 * hints.len())
+        .try_into()
+        .map_err(|_e| Error::External(format!("Too many hints provided: {}", hints.len())))?;
+    let hints_type = i64t.array_type(len);
+    let hints_array = emit_data.builder.build_array_alloca(
+        i64t,
+        i64t.const_int(len as u64, false),
+        "hints_array",
+    );
+    if let Some(inst_value) = hints_array.as_instruction() {
+        inst_value
+            .set_alignment(8)
+            .map_err(|s| Error::External(format!("Set alignment error: {}", s)))?;
+    }
+    emit_data.builder.build_store(
+        unsafe {
+            emit_data.builder.build_in_bounds_gep(
+                hints_type,
+                hints_array,
+                &[i64t.const_int(0, false)],
+                "hints_array_length",
+            )
+        },
+        i64t.const_int(hints.len() as u64, false),
+    );
+    // Fill in hints array
+    for (i, hint) in hints.iter().enumerate() {
+        let (address, size, write) = match hint {
+            Write::Hint {
+                address,
+                size,
+                write,
+            } => (address, *size, *write),
+            _ => {
+                return Err(Error::External(format!(
+                    "Non hint value {:?} is passed to emit_hints!",
+                    hint
+                )))
+            }
+        };
+        // offset
+        emit_data.builder.build_store(
+            unsafe {
+                emit_data.builder.build_in_bounds_gep(
+                    hints_type,
+                    hints_array,
+                    &[i64t.const_int(1 + i as u64 * 3, false)],
+                    &format!("hints_{}_offset", i),
+                )
+            },
+            emit_value(
+                context,
+                emit_data,
+                emitting_func,
+                address,
+                Some(&format!("hints_{}_offset_value", i)),
+            )?,
+        );
+        // size
+        emit_data.builder.build_store(
+            unsafe {
+                emit_data.builder.build_in_bounds_gep(
+                    hints_type,
+                    hints_array,
+                    &[
+                        i64t.const_int(0, false),
+                        i64t.const_int(1 + i as u64 * 3 + 1, false),
+                    ],
+                    &format!("hints_{}_size", i),
+                )
+            },
+            i64t.const_int(size, false),
+        );
+        // flags
+        emit_data.builder.build_store(
+            unsafe {
+                emit_data.builder.build_in_bounds_gep(
+                    hints_type,
+                    hints_array,
+                    &[
+                        i64t.const_int(0, false),
+                        i64t.const_int(1 + i as u64 * 3 + 2, false),
+                    ],
+                    &format!("hints_{}_flags", i),
+                )
+            },
+            i64t.const_int(if write { HINT_FLAG_WRITE } else { 0 }, false),
+        );
+    }
+    let hints_array_value =
+        emit_data
+            .builder
+            .build_ptr_to_int(hints_array, i64t, "hints_array_value");
+    let (memory_function, data) = emit_env_ffi_function(
+        context,
+        emit_data,
+        emitting_func.machine,
+        offset_of!(LlvmAotMachineEnv, check_memory_permissions),
+    )?;
+    let mut memory_args = [
+        memory_function.into(),
+        data.into(),
+        hints_array_value.into(),
+    ];
+    emit_ffi_call(
+        context,
+        emit_data,
+        emitting_func,
+        &mut memory_args,
+        false,
+        None,
+    )?;
+    Ok(())
+}
+
 // Emit a CKB-VM AST value via LLVM
 fn emit_value<'a>(
     context: &'a Context,
@@ -1333,18 +1491,14 @@ fn emit_value<'a>(
     let i1t = context.bool_type();
 
     match value {
-        Value::External(val, _) => {
-            // TODO: handle unhinted load here
-            emit_value(context, emit_data, emitting_func, &*val, Some("external"))
-        }
-        Value::Lr => emit_load_from_machine(
-            context,
-            emit_data,
-            machine,
-            offset_of!(LlvmAotCoreMachineData, load_reservation_address),
-            i64t,
-            Some("lr"),
-        ),
+        Value::Lr => Ok(emit_data
+            .builder
+            .build_load(
+                i64t,
+                emit_fetch_load_reservation_address(context, emit_data, machine)?,
+                "lr",
+            )
+            .into_int_value()),
         Value::Imm(i) => Ok(i64t.const_int(*i, false)),
         Value::Register(r) => emit_load_reg(context, emit_data, machine, allocas, *r, name),
         Value::Op1(op, val) => {
@@ -2100,9 +2254,6 @@ fn emit_value<'a>(
         }
         Value::Load(addr, size) => {
             let t = size_to_type(context, *size)?;
-            // TODO: maybe we should provide 2 modes:
-            // * Safe mode adds memory boundary checks
-            // * Fast mode relies on mmap-ed pages and OS to detect memory overflows
             let addr = emit_value(
                 context,
                 emit_data,
@@ -2131,6 +2282,25 @@ fn emit_value<'a>(
                 &format!("{}_load_casted", force_name),
             ))
         }
+        Value::External(val, t) => {
+            if *t == ExternalType::UnhintedLoad as u64 {
+                if let Value::Load(addr, size) = &**val {
+                    // Unhinted load
+                    emit_hints(
+                        context,
+                        emit_data,
+                        emitting_func,
+                        &[&Write::Hint {
+                            address: (&**addr).clone(),
+                            size: *size as u64,
+                            write: false,
+                        }],
+                    )?;
+                    return emit_value(context, emit_data, emitting_func, &*val, Some("external"));
+                }
+            }
+            return Err(Error::External(format!("Unexpected value: {:?}", value)));
+        }
     }
 }
 
@@ -2145,6 +2315,17 @@ fn emit_writes<'a>(
     let mut memory_ops = Vec::new();
     let mut register_ops = Vec::new();
     let mut lr_op = None;
+
+    // Split hints from writes
+    let hints: Vec<&Write> = writes
+        .iter()
+        .filter(|write| match write {
+            Write::Hint { .. } => true,
+            _ => false,
+        })
+        .collect();
+
+    emit_hints(context, emit_data, emitting_func, &hints)?;
 
     for (i, write) in writes.iter().enumerate() {
         let prefix = format!("{}_write{}", prefix, i);
@@ -2165,8 +2346,21 @@ fn emit_writes<'a>(
                 address,
                 size,
                 value,
-                hinted: _hinted,
+                hinted,
             } => {
+                if !hinted {
+                    // Unhinted writes
+                    emit_hints(
+                        context,
+                        emit_data,
+                        emitting_func,
+                        &[&Write::Hint {
+                            address: address.clone(),
+                            size: *size as u64,
+                            write: true,
+                        }],
+                    )?;
+                }
                 let address = emit_value(
                     context,
                     emit_data,
@@ -2218,15 +2412,10 @@ fn emit_writes<'a>(
         emit_data.builder.build_store(real_address, value);
     }
     if let Some(value) = lr_op {
-        emit_store_to_machine(
-            context,
-            emit_data,
-            emitting_func.machine,
+        emit_data.builder.build_store(
+            emit_fetch_load_reservation_address(context, emit_data, emitting_func.machine)?,
             value,
-            offset_of!(LlvmAotCoreMachineData, load_reservation_address),
-            context.i64_type(),
-            Some("lr"),
-        )?;
+        );
     }
     for (index, value) in register_ops {
         emit_store_reg(
@@ -3192,7 +3381,7 @@ fn emit<'a>(
     }
     for func in &emit_data.code.funcs {
         let function = emit_data.emitted_funcs[&func.range.start];
-        if !function.verify(false) {
+        if !function.verify(true) {
             return Err(Error::External(format!(
                 "verifying function {} at 0x{:x}",
                 func.force_name(true),
