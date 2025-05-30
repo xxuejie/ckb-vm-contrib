@@ -11,10 +11,15 @@ authors = ["Nervos Core Dev <dev@nervos.org>"]
 
 [workspace.dependencies]
 # CKB dependencies
-ckb-jsonrpc-types = "=0.200.0"
-ckb-traits = "=0.200.0"
-ckb-types = "=0.200.0"
-ckb-vm = "=0.24.13"
+# ckb-jsonrpc-types = "=0.200.0"
+# ckb-traits = "=0.200.0"
+# ckb-types = "=0.200.0"
+
+ckb-jsonrpc-types = { git = "https://github.com/nervosnetwork/ckb", rev = "99cd201" }
+ckb-traits = { git = "https://github.com/nervosnetwork/ckb", rev = "99cd201" }
+ckb-types = { git = "https://github.com/nervosnetwork/ckb", rev = "99cd201" }
+
+ckb-vm = "=0.24.14"
 
 # Crates defined in current workspace
 ckb-mock-tx-types = { path = "ckb-mock-tx-types", version = "0.200.1" }
