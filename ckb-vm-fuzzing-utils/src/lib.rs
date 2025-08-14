@@ -9,8 +9,8 @@ use ckb_std::{
     syscalls::traits::{Error, IoResult, SyscallImpls},
 };
 use ckb_vm::{
-    Error as VMError, Memory, Register, SupportMachine, Syscalls,
-    memory::load_c_string_byte_by_byte,
+    Error as VMError, Memory, RISCV_PAGESIZE, Register, SupportMachine, Syscalls,
+    memory::{FLAG_EXECUTABLE, FLAG_FREEZED, load_c_string_byte_by_byte},
     registers::{A0, A1, A2, A3, A4, A5, A7},
 };
 use core::ffi::CStr;
@@ -350,6 +350,77 @@ where
             }
         }
         Ok(true)
+    }
+}
+
+/// While SyscallImplsSynchronousWrapper provides a pure adapter converting
+/// ckb_vm::Syscalls style interfce to ckb_std::syscalls::traits::SyscallImpls
+/// style interface. Problems are still left on the table: in CKB's setup,
+/// SyscallImpls has no way of implementing load_cell_code. ckb-vm's Memory
+/// API is required to setup proper memory permissions required by load_cell_code.
+/// As SyscallImplsSynchronousWrapper is strictly defined as an adaptter pattern,
+/// it should not handle memory permission settings. Given a different setup,
+/// we might want to leverage SyscallImplsSynchronousWrapper for different
+/// use cases where load_cell_code might be implemented via alternative solution.
+///
+/// To cope with this issue, we introduced CkbFlavoredImplSyscalls, which assumes
+/// a CKB style design, this way we can implement load_cell_code properly via
+/// APIs provided by ckb-vm.
+pub struct CkbFlavoredImplSyscalls<S, M>(SyscallImplsSynchronousWrapper<S, M>);
+
+impl<S, M> CkbFlavoredImplSyscalls<S, M> {
+    pub fn new(impls: S) -> Self {
+        Self(SyscallImplsSynchronousWrapper::new(impls))
+    }
+
+    pub fn impls(&self) -> &S {
+        &self.0.impls
+    }
+
+    pub fn impls_mut(&mut self) -> &mut S {
+        &mut self.0.impls
+    }
+}
+
+impl<S, M> Syscalls<M> for CkbFlavoredImplSyscalls<S, M>
+where
+    S: SyscallImpls + Send,
+    M: SupportMachine + Send,
+{
+    fn initialize(&mut self, machine: &mut M) -> Result<(), VMError> {
+        self.0.initialize(machine)
+    }
+
+    fn ecall(&mut self, machine: &mut M) -> Result<bool, VMError> {
+        if let Ok(SyscallCode::LoadCellDataAsCode) = machine.registers()[A7].to_u64().try_into() {
+            let addr = machine.registers()[A0].to_u64();
+            let memory_size = machine.registers()[A1].to_u64();
+            let content_offset = machine.registers()[A2].to_u64() as usize;
+            let content_size = machine.registers()[A3].to_u64() as usize;
+            let index = machine.registers()[A4].to_u64() as usize;
+            let source = machine.registers()[A5].to_u64().try_into().expect("parse source");
+
+            let mut buf = vec![0u8; memory_size as usize];
+            let result = self.impls().load_cell_code(
+                buf.as_mut_ptr() as *mut u8,
+                memory_size as usize,
+                content_offset,
+                content_size,
+                index,
+                source,
+            );
+            machine.memory_mut().store_bytes(addr, &buf)?;
+            let mut current_addr = addr;
+            while current_addr < addr + memory_size {
+                let page = current_addr / RISCV_PAGESIZE as u64;
+                machine.memory_mut().set_flag(page, FLAG_EXECUTABLE | FLAG_FREEZED)?;
+                current_addr += RISCV_PAGESIZE as u64;
+            }
+            self.0.set_return(result, machine);
+
+            return Ok(true);
+        }
+        self.0.ecall(machine)
     }
 }
 

@@ -22,7 +22,7 @@ use ckb_std::{
     ckb_constants::{CellField, HeaderField, InputField, Source},
     syscalls::traits::{Error, IoResult, SyscallImpls},
 };
-use ckb_vm_fuzzing_utils::{exit_with_panic, flatten_args};
+use ckb_vm_fuzzing_utils::{CkbFlavoredImplSyscalls, exit_with_panic, flatten_args};
 use core::ffi::CStr;
 use prost::Message;
 use spin::Mutex;
@@ -44,11 +44,15 @@ where
     ckb_vm_fuzzing_utils::entry(impls, f, argv)
 }
 
+/// When you need SyscallImpls directly.
 pub struct ProtobufBasedSyscallImpls {
     syscalls: Mutex<VecDeque<traces::Syscall>>,
     args: Vec<Vec<u8>>,
     debug_printer: Box<dyn Fn(&str) + Send + Sync>,
 }
+
+/// When you want to use protobuf based syscalls for a ckb-vm::Machine.
+pub type ProtobufBasedSyscalls<M> = CkbFlavoredImplSyscalls<ProtobufBasedSyscallImpls, M>;
 
 impl ProtobufBasedSyscallImpls {
     fn new(syscalls: traces::Syscalls) -> Option<Self> {
