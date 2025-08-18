@@ -22,8 +22,10 @@ use ckb_std::{
     ckb_constants::{CellField, HeaderField, InputField, Source},
     syscalls::traits::{Error, IoResult, SyscallImpls},
 };
-use ckb_vm_fuzzing_utils::{CkbFlavoredImplSyscalls, exit_with_panic, flatten_args};
+use ckb_vm::SupportMachine;
+use ckb_vm_fuzzing_utils::{CkbvmRunnerImpls, exit_with_panic, flatten_args};
 use core::ffi::CStr;
+use core::marker::PhantomData;
 use prost::Message;
 use spin::Mutex;
 
@@ -36,7 +38,7 @@ pub fn entry<F>(data: &[u8], f: F) -> i8
 where
     F: Fn() -> i8 + std::panic::UnwindSafe,
 {
-    let Some(impls) = ProtobufBasedSyscallImpls::new_with_bytes(data) else {
+    let Some(impls) = ProtobufImpls::new_with_bytes(data) else {
         return UNEXPECTED as i8;
     };
     let (argc, argv) = flatten_args(impls.args());
@@ -44,17 +46,13 @@ where
     ckb_vm_fuzzing_utils::entry(impls, f, argv)
 }
 
-/// When you need SyscallImpls directly.
-pub struct ProtobufBasedSyscallImpls {
+pub struct ProtobufImpls {
     syscalls: Mutex<VecDeque<traces::Syscall>>,
     args: Vec<Vec<u8>>,
     debug_printer: Box<dyn Fn(&str) + Send + Sync>,
 }
 
-/// When you want to use protobuf based syscalls for a ckb-vm::Machine.
-pub type ProtobufBasedSyscalls<M> = CkbFlavoredImplSyscalls<ProtobufBasedSyscallImpls, M>;
-
-impl ProtobufBasedSyscallImpls {
+impl ProtobufImpls {
     fn new(syscalls: traces::Syscalls) -> Option<Self> {
         Some(Self {
             syscalls: Mutex::new(syscalls.syscalls.into()),
@@ -145,7 +143,7 @@ impl ProtobufBasedSyscallImpls {
     }
 }
 
-impl SyscallImpls for ProtobufBasedSyscallImpls {
+impl SyscallImpls for ProtobufImpls {
     fn debug(&self, s: &CStr) {
         (self.debug_printer)(s.to_str().unwrap_or("utf8 error"));
     }
@@ -383,5 +381,204 @@ impl SyscallImpls for ProtobufBasedSyscallImpls {
 
     fn load_block_extension(&self, buf: &mut [u8], offset: usize, _index: usize, _source: Source) -> IoResult {
         self.io_syscall(buf, offset, None)
+    }
+}
+
+// TODO: it remains a question if this should be it's own type, or we should
+// merge it with ProtobufImpls. Merging them is easier at times, but there are
+// cases where we don't really need a machine type(e.g., fuzzing).
+pub struct ProtobufVmRunnerImpls<M> {
+    inner: ProtobufImpls,
+    _marker: PhantomData<M>,
+}
+
+impl<M> ProtobufVmRunnerImpls<M> {
+    pub fn new_with_bytes<B: AsRef<[u8]>>(bytes: B) -> Option<Self> {
+        ProtobufImpls::new_with_bytes(bytes).map(|inner| Self { inner, _marker: PhantomData })
+    }
+
+    #[cfg(feature = "std")]
+    pub fn new_with_file<P: AsRef<std::path::Path>>(path: P) -> Option<Self> {
+        ProtobufImpls::new_with_file(path).map(|inner| Self { inner, _marker: PhantomData })
+    }
+
+    pub fn args(&self) -> &[Vec<u8>] {
+        self.inner.args()
+    }
+}
+
+impl<M> SyscallImpls for ProtobufVmRunnerImpls<M> {
+    fn debug(&self, s: &CStr) {
+        self.inner.debug(s);
+    }
+
+    fn exit(&self, code: i8) -> ! {
+        self.inner.exit(code)
+    }
+
+    fn load_cell(&self, buf: &mut [u8], offset: usize, index: usize, source: Source) -> IoResult {
+        self.inner.load_cell(buf, offset, index, source)
+    }
+
+    fn load_cell_by_field(
+        &self,
+        buf: &mut [u8],
+        offset: usize,
+        index: usize,
+        source: Source,
+        field: CellField,
+    ) -> IoResult {
+        self.inner.load_cell_by_field(buf, offset, index, source, field)
+    }
+
+    fn load_cell_code(
+        &self,
+        buf_ptr: *mut u8,
+        len: usize,
+        content_offset: usize,
+        content_size: usize,
+        index: usize,
+        source: Source,
+    ) -> Result<(), Error> {
+        self.inner.load_cell_code(buf_ptr, len, content_offset, content_size, index, source)
+    }
+
+    fn load_cell_data(&self, buf: &mut [u8], offset: usize, index: usize, source: Source) -> IoResult {
+        self.inner.load_cell_data(buf, offset, index, source)
+    }
+
+    fn load_header(&self, buf: &mut [u8], offset: usize, index: usize, source: Source) -> IoResult {
+        self.inner.load_header(buf, offset, index, source)
+    }
+
+    fn load_header_by_field(
+        &self,
+        buf: &mut [u8],
+        offset: usize,
+        index: usize,
+        source: Source,
+        field: HeaderField,
+    ) -> IoResult {
+        self.inner.load_header_by_field(buf, offset, index, source, field)
+    }
+
+    fn load_input(&self, buf: &mut [u8], offset: usize, index: usize, source: Source) -> IoResult {
+        self.inner.load_input(buf, offset, index, source)
+    }
+
+    fn load_input_by_field(
+        &self,
+        buf: &mut [u8],
+        offset: usize,
+        index: usize,
+        source: Source,
+        field: InputField,
+    ) -> IoResult {
+        self.inner.load_input_by_field(buf, offset, index, source, field)
+    }
+
+    fn load_script(&self, buf: &mut [u8], offset: usize) -> IoResult {
+        self.inner.load_script(buf, offset)
+    }
+
+    fn load_script_hash(&self, buf: &mut [u8], offset: usize) -> IoResult {
+        self.inner.load_script_hash(buf, offset)
+    }
+
+    fn load_transaction(&self, buf: &mut [u8], offset: usize) -> IoResult {
+        self.inner.load_transaction(buf, offset)
+    }
+
+    fn load_tx_hash(&self, buf: &mut [u8], offset: usize) -> IoResult {
+        self.inner.load_tx_hash(buf, offset)
+    }
+
+    fn load_witness(&self, buf: &mut [u8], offset: usize, index: usize, source: Source) -> IoResult {
+        self.inner.load_witness(buf, offset, index, source)
+    }
+
+    fn vm_version(&self) -> u64 {
+        self.inner.vm_version()
+    }
+
+    fn current_cycles(&self) -> u64 {
+        self.inner.current_cycles()
+    }
+
+    fn exec(&self, index: usize, source: Source, place: usize, bounds: usize, argv: &[&CStr]) -> Result<(), Error> {
+        self.inner.exec(index, source, place, bounds, argv)
+    }
+
+    fn spawn(
+        &self,
+        index: usize,
+        source: Source,
+        place: usize,
+        bounds: usize,
+        argv: &[&CStr],
+        inherited_fds: &[u64],
+    ) -> Result<u64, Error> {
+        self.inner.spawn(index, source, place, bounds, argv, inherited_fds)
+    }
+
+    fn pipe(&self) -> Result<(u64, u64), Error> {
+        self.inner.pipe()
+    }
+
+    fn inherited_fds(&self, out_fds: &mut [u64]) -> Result<usize, Error> {
+        self.inner.inherited_fds(out_fds)
+    }
+
+    fn read(&self, fd: u64, buffer: &mut [u8]) -> Result<usize, Error> {
+        self.inner.read(fd, buffer)
+    }
+
+    fn write(&self, fd: u64, buffer: &[u8]) -> Result<usize, Error> {
+        self.inner.write(fd, buffer)
+    }
+
+    fn close(&self, fd: u64) -> Result<(), Error> {
+        self.inner.close(fd)
+    }
+
+    fn wait(&self, pid: u64) -> Result<i8, Error> {
+        self.inner.wait(pid)
+    }
+
+    fn process_id(&self) -> u64 {
+        self.inner.process_id()
+    }
+
+    fn load_block_extension(&self, buf: &mut [u8], offset: usize, index: usize, source: Source) -> IoResult {
+        self.inner.load_block_extension(buf, offset, index, source)
+    }
+}
+
+impl<M: SupportMachine> CkbvmRunnerImpls<M> for ProtobufVmRunnerImpls<M> {
+    fn fetch_cell_code(
+        &self,
+        _content_offset: usize,
+        content_size: usize,
+        _index: usize,
+        _source: Source,
+    ) -> Result<Vec<u8>, Error> {
+        match self.inner.syscall() {
+            Some(traces::syscall::Value::ReturnWithCode(code)) => {
+                let Ok(e): Result<Error, _> = (code as u64).try_into() else {
+                    return Err(UNEXPECTED_ERROR);
+                };
+                Err(e)
+            }
+            Some(traces::syscall::Value::IoData(io_data)) => {
+                if io_data.additional_length > 0 {
+                    return Err(UNEXPECTED_ERROR);
+                }
+                if io_data.available_data.len() != content_size {
+                    return Err(UNEXPECTED_ERROR);
+                }
+                Ok(io_data.available_data)
+            }
+            _ => Err(UNEXPECTED_ERROR),
+        }
     }
 }

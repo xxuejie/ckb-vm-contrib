@@ -9,7 +9,7 @@ use ckb_std::{
     syscalls::traits::{Error, IoResult, SyscallImpls},
 };
 use ckb_vm::{
-    Error as VMError, Memory, RISCV_PAGESIZE, Register, SupportMachine, Syscalls,
+    Error as VMError, Memory, Register, SupportMachine, Syscalls,
     memory::{FLAG_EXECUTABLE, FLAG_FREEZED, load_c_string_byte_by_byte},
     registers::{A0, A1, A2, A3, A4, A5, A7},
 };
@@ -49,20 +49,62 @@ pub enum SyscallCode {
     Debug = 2177,
 }
 
-pub struct SyscallImplsSynchronousWrapper<S, M> {
+/// SyscallImpls, in many cases, have already built a unified type-safe API interface
+/// for CKB syscalls. It is still limited in certain cases:
+/// * A primary use case for SyscallImpls will be representing APIs in CKB scripts.
+///   As a result, the APIs in SyscallImpls must be designed to be simple for script
+///   usage.
+/// * The APIs in SyscallImpls must also fit native compilation of scripts, such as
+///   fuzzing usage.
+/// As a result, SyscallImpls has zero knowledge on ckb_vm's internal data structure,
+/// making it difficult to implement certain syscalls, such as load_cell_code. Here
+/// we are augmenting SyscallImpls with a different trait CkbvmRunnerImpls. In cases
+/// where we are building actual syscall implementations for ckb-vm machines, CkbvmRunnerImpls
+/// augments SyscallImpls with additional powers, so a single set of syscall implementations
+/// can suit all use cases.
+pub trait CkbvmRunnerImpls<Mac: SupportMachine> {
+    fn fetch_cell_code(
+        &self,
+        content_offset: usize,
+        content_size: usize,
+        index: usize,
+        source: Source,
+    ) -> Result<Vec<u8>, Error>;
+
+    /// A naive load_cell_code when you just need a simple implementation.
+    /// For more complicated cases(e.g., lazy loader), one can override this
+    /// function on their own.
+    fn load_cell_code(&self, machine: &mut Mac) -> Result<(), Error> {
+        let addr = machine.registers()[A0].to_u64();
+        let memory_size = machine.registers()[A1].to_u64();
+        let content_offset = machine.registers()[A2].to_u64() as usize;
+        let content_size = machine.registers()[A3].to_u64() as usize;
+        let index = machine.registers()[A4].to_u64() as usize;
+        let source = machine.registers()[A5].to_u64().try_into().expect("parse source");
+
+        let code = self.fetch_cell_code(content_offset, content_size, index, source)?;
+        machine
+            .memory_mut()
+            .init_pages(addr, memory_size, FLAG_EXECUTABLE | FLAG_FREEZED, Some(code.into()), 0)
+            .expect("init pages");
+        Ok(())
+    }
+}
+
+pub struct SynchronousSyscalls<S, M> {
     pub impls: S,
     _marker: PhantomData<M>,
 }
 
-impl<S, M> SyscallImplsSynchronousWrapper<S, M> {
+impl<S, M> SynchronousSyscalls<S, M> {
     pub fn new(impls: S) -> Self {
         Self { impls, _marker: PhantomData }
     }
 }
 
-impl<S, M> SyscallImplsSynchronousWrapper<S, M>
+impl<S, M> SynchronousSyscalls<S, M>
 where
-    S: SyscallImpls + Send,
+    S: SyscallImpls + CkbvmRunnerImpls<M> + Send,
     M: SupportMachine + Send,
 {
     fn set_return<V>(&self, result: Result<V, Error>, machine: &mut M) {
@@ -131,13 +173,13 @@ where
     }
 }
 
-/// Note that SyscallImplsSynchronousWrapper assumes synchronous operations for now,
+/// Note that SynchronousSyscalls assumes synchronous operations for now,
 /// this means all syscalls, including spawn / exec / read / write are expected
 /// to terminate in a single method call, there is no scheduler-like message box
 /// used.
-impl<S, M> Syscalls<M> for SyscallImplsSynchronousWrapper<S, M>
+impl<S, M> Syscalls<M> for SynchronousSyscalls<S, M>
 where
-    S: SyscallImpls + Send,
+    S: SyscallImpls + CkbvmRunnerImpls<M> + Send,
     M: SupportMachine + Send,
 {
     fn initialize(&mut self, _machine: &mut M) -> Result<(), VMError> {
@@ -177,13 +219,7 @@ where
                 impls.load_input_by_field(buf, offset, index, source, field)
             })?,
             SyscallCode::LoadCellDataAsCode => {
-                let addr = machine.registers()[A0].to_u64() as *mut u8;
-                let memory_size = machine.registers()[A1].to_u64() as usize;
-                let content_offset = machine.registers()[A2].to_u64() as usize;
-                let content_size = machine.registers()[A3].to_u64() as usize;
-                let index = machine.registers()[A4].to_u64() as usize;
-                let source = machine.registers()[A5].to_u64().try_into().expect("parse source");
-                let result = self.impls.load_cell_code(addr, memory_size, content_offset, content_size, index, source);
+                let result = CkbvmRunnerImpls::load_cell_code(&self.impls, machine);
                 self.set_return(result, machine);
             }
             SyscallCode::LoadCellData => self.load_ois(machine, |buf, impls, offset, index, source| {
@@ -350,77 +386,6 @@ where
             }
         }
         Ok(true)
-    }
-}
-
-/// While SyscallImplsSynchronousWrapper provides a pure adapter converting
-/// ckb_vm::Syscalls style interfce to ckb_std::syscalls::traits::SyscallImpls
-/// style interface. Problems are still left on the table: in CKB's setup,
-/// SyscallImpls has no way of implementing load_cell_code. ckb-vm's Memory
-/// API is required to setup proper memory permissions required by load_cell_code.
-/// As SyscallImplsSynchronousWrapper is strictly defined as an adaptter pattern,
-/// it should not handle memory permission settings. Given a different setup,
-/// we might want to leverage SyscallImplsSynchronousWrapper for different
-/// use cases where load_cell_code might be implemented via alternative solution.
-///
-/// To cope with this issue, we introduced CkbFlavoredImplSyscalls, which assumes
-/// a CKB style design, this way we can implement load_cell_code properly via
-/// APIs provided by ckb-vm.
-pub struct CkbFlavoredImplSyscalls<S, M>(SyscallImplsSynchronousWrapper<S, M>);
-
-impl<S, M> CkbFlavoredImplSyscalls<S, M> {
-    pub fn new(impls: S) -> Self {
-        Self(SyscallImplsSynchronousWrapper::new(impls))
-    }
-
-    pub fn impls(&self) -> &S {
-        &self.0.impls
-    }
-
-    pub fn impls_mut(&mut self) -> &mut S {
-        &mut self.0.impls
-    }
-}
-
-impl<S, M> Syscalls<M> for CkbFlavoredImplSyscalls<S, M>
-where
-    S: SyscallImpls + Send,
-    M: SupportMachine + Send,
-{
-    fn initialize(&mut self, machine: &mut M) -> Result<(), VMError> {
-        self.0.initialize(machine)
-    }
-
-    fn ecall(&mut self, machine: &mut M) -> Result<bool, VMError> {
-        if let Ok(SyscallCode::LoadCellDataAsCode) = machine.registers()[A7].to_u64().try_into() {
-            let addr = machine.registers()[A0].to_u64();
-            let memory_size = machine.registers()[A1].to_u64();
-            let content_offset = machine.registers()[A2].to_u64() as usize;
-            let content_size = machine.registers()[A3].to_u64() as usize;
-            let index = machine.registers()[A4].to_u64() as usize;
-            let source = machine.registers()[A5].to_u64().try_into().expect("parse source");
-
-            let mut buf = vec![0u8; memory_size as usize];
-            let result = self.impls().load_cell_code(
-                buf.as_mut_ptr() as *mut u8,
-                memory_size as usize,
-                content_offset,
-                content_size,
-                index,
-                source,
-            );
-            machine.memory_mut().store_bytes(addr, &buf)?;
-            let mut current_addr = addr;
-            while current_addr < addr + memory_size {
-                let page = current_addr / RISCV_PAGESIZE as u64;
-                machine.memory_mut().set_flag(page, FLAG_EXECUTABLE | FLAG_FREEZED)?;
-                current_addr += RISCV_PAGESIZE as u64;
-            }
-            self.0.set_return(result, machine);
-
-            return Ok(true);
-        }
-        self.0.ecall(machine)
     }
 }
 

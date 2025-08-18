@@ -1828,6 +1828,7 @@ name = "protobuf-ckb-syscalls"
 version = "0.202.0"
 dependencies = [
  "ckb-std",
+ "ckb-vm 0.24.14",
  "ckb-vm-fuzzing-utils",
  "once_cell",
  "prost",
